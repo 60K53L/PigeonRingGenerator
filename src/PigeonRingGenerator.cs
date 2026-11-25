@@ -1374,132 +1374,83 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
     // USE-SURFACE: GERÇEK ŞABLON YÜZEYİ ÖRNEKLEME VE MESH YARDIMCILARI
     // ==========================================
     // ==========================================
-    // ŞABLON BOYAMASI (OrcaSlicer paint_color, çok renkli gövde)
+    // ÇİFT RENK GÖVDE (OrcaSlicer paint_color)
     // ==========================================
-    /// <summary>Şablondaki her üçgenin paint_color değeri (yoksa ""), üçgen sırasıyla.</summary>
-    public static List<string> ParsePaintFromModelXml(string modelXmlContent)
-    {
-        List<string> paint = new List<string>();
-        XmlDocument doc = new XmlDocument();
-        doc.LoadXml(modelXmlContent);
-        XmlNamespaceManager nsmgr = new XmlNamespaceManager(doc.NameTable);
-        nsmgr.AddNamespace("m", "http://schemas.microsoft.com/3dmanufacturing/core/2015/02");
-        foreach (XmlNode n in doc.SelectNodes("//m:mesh/m:triangles/m:triangle", nsmgr))
-        {
-            XmlAttribute a = n.Attributes["paint_color"];
-            paint.Add(a != null ? a.Value : "");
-        }
-        return paint;
-    }
-
-    private static int HexNibble(char c)
-    {
-        if (c >= '0' && c <= '9') return c - '0';
-        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-        return -1;
-    }
-
     /// <summary>
-    /// OrcaSlicer üçgen boyama dizisindeki extruder durumlarını yeniden eşler (alt bölümlemeler korunur).
-    /// Dizi sondan başa okunan 4 bitlik düğümlerden oluşur: alt 2 bit = bölünen kenar sayısı (0 = yaprak),
-    /// yaprakta üst 2 bit = durum (3 ise bir sonraki nibble + 3). Geçersiz dizide null döner.
+    /// Gövdeyi tek parça ve su geçirmez tutarak üçgenlerini tam orta yükseklikte (ör. 9 mm gövdede 4.5 mm)
+    /// böler; her üçgen bütünüyle ya alttadır ya üstte. Alt yarı boyasız (parça extruder'ı = R1),
+    /// üst yarı extruder 2 (R2) olarak boyanır. Sınır tam olarak orta düzlemdedir.
     /// </summary>
-    public static string RemapPaintStates(string paint, Func<int, int> map)
+    public static SolidMesh BuildTwoColorBody(SolidMesh ring, out List<string> paint)
     {
-        string src = string.IsNullOrEmpty(paint) ? "0" : paint;
-        int pos = src.Length - 1;
-        List<int> outNibbles = new List<int>();
-        bool ok = true;
-        Action node = null;
-        node = () =>
+        paint = new List<string>();
+        SolidMesh m = new SolidMesh();
+        if (ring == null || ring.Vertices.Count == 0) return m;
+
+        double minZ = double.MaxValue, maxZ = double.MinValue;
+        foreach (var v in ring.Vertices) { m.AddVertex(v.x, v.y, v.z); if (v.z < minZ) minZ = v.z; if (v.z > maxZ) maxZ = v.z; }
+        double zc = (minZ + maxZ) * 0.5;
+        const double eps = 1e-6;
+
+        Dictionary<long, int> cutCache = new Dictionary<long, int>();
+        Func<int, int, int> cut = (ia, ib) =>
         {
-            if (!ok || pos < 0) { ok = false; return; }
-            int code = HexNibble(src[pos--]);
-            if (code < 0) { ok = false; return; }
-            int split = code & 3;
-            if (split == 0)
+            long key = ia < ib ? (((long)ia << 32) | (uint)ib) : (((long)ib << 32) | (uint)ia);
+            int idx;
+            if (cutCache.TryGetValue(key, out idx)) return idx;
+            Vec3 A = ring.Vertices[ia], B = ring.Vertices[ib];
+            double t = (zc - A.z) / (B.z - A.z);
+            idx = m.AddVertex(A.x + (B.x - A.x) * t, A.y + (B.y - A.y) * t, zc);
+            cutCache[key] = idx;
+            return idx;
+        };
+        Func<int, int> side = vi =>
+        {
+            double z = ring.Vertices[vi].z;
+            return z > zc + eps ? 1 : (z < zc - eps ? -1 : 0);
+        };
+        List<string> pl = paint;
+        Action<int, int, int, int> emit = (a1, b1, c1, sd) =>
+        {
+            m.AddTriangle(a1, b1, c1);
+            pl.Add(sd > 0 ? "8" : "");      // "8" = extruder 2 (R2); boş = parçanın extruder'ı (R1)
+        };
+
+        foreach (Tri t in ring.Triangles)
+        {
+            int[] v = { t.v1, t.v2, t.v3 };
+            int[] sg = { side(v[0]), side(v[1]), side(v[2]) };
+            bool hasUp = sg[0] > 0 || sg[1] > 0 || sg[2] > 0;
+            bool hasDown = sg[0] < 0 || sg[1] < 0 || sg[2] < 0;
+            if (!(hasUp && hasDown))
             {
-                int st = code >> 2;
-                if (st == 3)
-                {
-                    if (pos < 0) { ok = false; return; }
-                    int ext = HexNibble(src[pos--]);
-                    if (ext < 0) { ok = false; return; }
-                    st = ext + 3;
-                }
-                st = map(st);
-                if (st < 3) outNibbles.Add(st << 2);
-                else { outNibbles.Add(0xC); outNibbles.Add(st - 3); }
+                emit(v[0], v[1], v[2], hasUp ? 1 : -1);
+                continue;
+            }
+            // Döndürerek (yön korunur) ilk köşeyi seç
+            int zeroAt = Array.IndexOf(sg, 0);
+            if (zeroAt >= 0)
+            {
+                // Bir köşe düzlemde, diğer ikisi zıt taraflarda: karşı kenardan böl
+                int a0 = v[zeroAt], b0 = v[(zeroAt + 1) % 3], c0 = v[(zeroAt + 2) % 3];
+                int sb = sg[(zeroAt + 1) % 3], sc = sg[(zeroAt + 2) % 3];
+                int pidx = cut(b0, c0);
+                emit(a0, b0, pidx, sb);
+                emit(a0, pidx, c0, sc);
             }
             else
             {
-                outNibbles.Add(code);
-                for (int i = 0; i <= split && ok; i++) node();
+                // Tek başına kalan köşe (diğer ikisi karşı tarafta)
+                int lone = (sg[0] != sg[1] && sg[0] != sg[2]) ? 0 : ((sg[1] != sg[0] && sg[1] != sg[2]) ? 1 : 2);
+                int a0 = v[lone], b0 = v[(lone + 1) % 3], c0 = v[(lone + 2) % 3];
+                int sa = sg[lone], so = -sa;
+                int pidx = cut(a0, b0), qidx = cut(a0, c0);
+                emit(a0, pidx, qidx, sa);
+                emit(pidx, b0, c0, so);
+                emit(pidx, c0, qidx, so);
             }
-        };
-        node();
-        if (!ok || pos != -1) return null;
-        if (outNibbles.Count == 1 && outNibbles[0] == 0) return "";   // tamamı boyasız
-        StringBuilder sb = new StringBuilder(outNibbles.Count);
-        for (int i = outNibbles.Count - 1; i >= 0; i--) sb.Append("0123456789ABCDEF"[outNibbles[i]]);
-        return sb.ToString();
-    }
-
-    /// <summary>
-    /// Çift renk tablası için gövde boyaması: şablonun alt ve üst kapak renklerine bakarak
-    /// alt yarıyı extruder 1 (R1), üst yarıyı extruder 2 (R2) olacak şekilde yeniden numaralandırır.
-    /// Şablonda iki farklı renk yoksa null döner.
-    /// </summary>
-    public static List<string> BuildTwoColorBodyPaint(SolidMesh ring, List<string> paint, out string note)
-    {
-        note = null;
-        if (ring == null || paint == null || paint.Count != ring.Triangles.Count) { note = "şablonda boyama verisi bulunamadı"; return null; }
-        double minZ = double.MaxValue, maxZ = double.MinValue;
-        foreach (var v in ring.Vertices) { if (v.z < minZ) minZ = v.z; if (v.z > maxZ) maxZ = v.z; }
-
-        Dictionary<int, int> lowVotes = new Dictionary<int, int>(), highVotes = new Dictionary<int, int>();
-        for (int i = 0; i < ring.Triangles.Count; i++)
-        {
-            Tri t = ring.Triangles[i];
-            Vec3 a = ring.Vertices[t.v1], b = ring.Vertices[t.v2], c = ring.Vertices[t.v3];
-            bool atLow = Math.Abs(a.z - minZ) < 1e-4 && Math.Abs(b.z - minZ) < 1e-4 && Math.Abs(c.z - minZ) < 1e-4;
-            bool atHigh = Math.Abs(a.z - maxZ) < 1e-4 && Math.Abs(b.z - maxZ) < 1e-4 && Math.Abs(c.z - maxZ) < 1e-4;
-            if (!atLow && !atHigh) continue;
-            int st = -1;
-            RemapPaintStates(paint[i], s => { st = s; return s; });
-            if (st < 0) continue;
-            Dictionary<int, int> votes = atLow ? lowVotes : highVotes;
-            int cnt; votes.TryGetValue(st, out cnt); votes[st] = cnt + 1;
         }
-        int lowState = -1, highState = -1, best = 0;
-        foreach (var kv in lowVotes) if (kv.Value > best) { best = kv.Value; lowState = kv.Key; }
-        best = 0;
-        foreach (var kv in highVotes) if (kv.Value > best) { best = kv.Value; highState = kv.Key; }
-        if (lowState < 0 || highState < 0 || lowState == highState)
-        {
-            note = "şablonda alt/üst renk ayrımı yok";
-            return null;
-        }
-
-        // Boyasız (0) = parçanın kendi extruder'ı = 1
-        Func<int, int> map = st =>
-        {
-            int eff = st;
-            if (st == lowState) return 1;
-            if (st == highState) return 2;
-            if (eff == 0) return 0;
-            return eff;
-        };
-        List<string> result = new List<string>(paint.Count);
-        for (int i = 0; i < paint.Count; i++)
-        {
-            string r = RemapPaintStates(paint[i], map);
-            if (r == null) { note = "şablon boyaması okunamadı"; return null; }
-            // Boyasız üçgen artık parça rengiyle (1) aynıysa boş bırak
-            result.Add(r);
-        }
-        return result;
+        return m;
     }
 
     public static void WriteRingObject(StreamWriter sw, int objectId, SolidMesh ring, List<string> paint)
@@ -3415,13 +3366,11 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
 
             // 2. Ham tek parça gövdeyi oku, dinamik Z ölçeğini hesapla ve Use-Surface örnekleyici kur
             SolidMesh wholeRing = ParseMeshFromModelXml(ringXml);
-            string paintNote;
-            List<string> twoColorPaint = BuildTwoColorBodyPaint(wholeRing, ParsePaintFromModelXml(ringXml), out paintNote);
-            if (twoColorPaint == null)
-                fullLog("UYARI: Çift renk tablası tek renk gövdeyle üretilecek (" + paintNote + ").");
-            else
-                fullLog("Çift renk gövde: alt yarı R1, üst yarı R2 (şablon boyamasından).");
-            int plate2RingId = twoColorPaint != null ? 2 : 1;
+            List<string> twoColorPaint;
+            SolidMesh twoColorRing = BuildTwoColorBody(wholeRing, out twoColorPaint);
+            fullLog(string.Format("Çift renk gövde: alt yarı R1, üst yarı R2 (sınır tam orta yükseklikte, {0} -> {1} üçgen, gövde tek parça).",
+                wholeRing.Triangles.Count, twoColorRing.Triangles.Count));
+            int plate2RingId = 2;
             double origMinZ = double.MaxValue, origMaxZ = double.MinValue;
             foreach (var v in wholeRing.Vertices) { if (v.z < origMinZ) origMinZ = v.z; if (v.z > origMaxZ) origMaxZ = v.z; }
             double origH = (origMaxZ > origMinZ) ? (origMaxZ - origMinZ) : 7.168;
@@ -3497,7 +3446,7 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                 // Object 1: ring_whole (Tabla 1, düz renk gövde, boyasız)
                 // Object 2: ring_cift_renk (Tabla 2, alt yarı R1 / üst yarı R2 boyalı aynı gövde)
                 WriteRingObject(sw, 1, wholeRing, null);
-                if (twoColorPaint != null) WriteRingObject(sw, 2, wholeRing, twoColorPaint);
+                WriteRingObject(sw, 2, twoColorRing, twoColorPaint);
 
                 // Objects 4..(4 + count - 1): text meshes
                 for (int i = 0; i < count; i++)
@@ -4169,13 +4118,11 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
 
             // Ham tek parça gövdeyi oku, dinamik Z ölçeğini hesapla ve Use-Surface örnekleyici kur
             SolidMesh wholeRing = ParseMeshFromModelXml(ringXml);
-            string paintNote;
-            List<string> twoColorPaint = BuildTwoColorBodyPaint(wholeRing, ParsePaintFromModelXml(ringXml), out paintNote);
-            if (twoColorPaint == null)
-                fullLog("UYARI: Çift renk tablası tek renk gövdeyle üretilecek (" + paintNote + ").");
-            else
-                fullLog("Çift renk gövde: alt yarı R1, üst yarı R2 (şablon boyamasından).");
-            int plate2RingId = twoColorPaint != null ? 2 : 1;
+            List<string> twoColorPaint;
+            SolidMesh twoColorRing = BuildTwoColorBody(wholeRing, out twoColorPaint);
+            fullLog(string.Format("Çift renk gövde: alt yarı R1, üst yarı R2 (sınır tam orta yükseklikte, {0} -> {1} üçgen, gövde tek parça).",
+                wholeRing.Triangles.Count, twoColorRing.Triangles.Count));
+            int plate2RingId = 2;
             double origMinZ = double.MaxValue, origMaxZ = double.MinValue;
             foreach (var v in wholeRing.Vertices) { if (v.z < origMinZ) origMinZ = v.z; if (v.z > origMaxZ) origMaxZ = v.z; }
             double origH = (origMaxZ > origMinZ) ? (origMaxZ - origMinZ) : (isMarkaTipi ? 8.000 : 7.168);
@@ -4264,7 +4211,7 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                 // Object 1: ring_whole (Tabla 1, düz renk gövde, boyasız)
                 // Object 2: ring_cift_renk (Tabla 2, alt yarı R1 / üst yarı R2 boyalı aynı gövde)
                 WriteRingObject(sw, 1, wholeRing, null);
-                if (twoColorPaint != null) WriteRingObject(sw, 2, wholeRing, twoColorPaint);
+                WriteRingObject(sw, 2, twoColorRing, twoColorPaint);
 
                 // Object 4: text_top
                 sw.WriteLine("  <object id=\"4\" type=\"model\">");

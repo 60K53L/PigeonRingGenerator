@@ -809,6 +809,46 @@ public class PigeonRingGenerator
     // 4. CYLINDRICAL DISTRIBUTED TEXT GENERATION (ARIAL BOLD + ROBUST TOPOLOGY)
     // ==========================================
     // Kullanıcı G yazdığında tik seçiliyse otomatik Ğ yapıcı, seçili değilse şapkasız G yapıcı; 'i' harfini (örn: BEKiR) daima korur:
+    // Kabartma yazının alt kenarı için sarkma önleyici pah açısı (dikeyden derece).
+    // 45° = FDM'de desteksiz basılabilen güvenli eğim. 0 = pah kapalı (eski radyal duvarlar).
+    public static double DefaultOverhangChamferDeg = 0.0;
+
+    // Son yazı üretiminde bant sınırı yüzünden küçültme olduysa açıklaması (yoksa null)
+    [ThreadStatic] public static string LastTextFitNote;
+
+    /// <summary>
+    /// Harf gövdesine dokunmadan yalnızca aksan bölgelerini (H yüksekliğinin üstü ve taban çizgisinin altı)
+    /// k oranında dikeyde sıkıştırır. k = 1 değişiklik yapmaz.
+    /// </summary>
+    public static GraphicsPath CompactAccents(GraphicsPath src, float capTop, float baseline, float k)
+    {
+        if (src == null || src.PointCount == 0 || k >= 0.999f) return src;
+        PointF[] pts = src.PathPoints;
+        byte[] types = src.PathTypes;
+        for (int i = 0; i < pts.Length; i++)
+        {
+            float y = pts[i].Y;
+            if (y < capTop) y = capTop - (capTop - y) * k;
+            else if (y > baseline) y = baseline + (y - baseline) * k;
+            pts[i] = new PointF(pts[i].X, y);
+        }
+        GraphicsPath dst = new GraphicsPath(pts, types, src.FillMode);
+        src.Dispose();
+        return dst;
+    }
+
+    /// <summary>
+    /// Aksanların banda sığması için gereken sıkıştırma oranı (0.45 - 1). Tüm değerler aynı birimde (ör. mm).
+    /// </summary>
+    public static double AccentCompressionFactor(double capOuterH, double aboveH, double belowH, double allowedH)
+    {
+        double need = aboveH + belowH;
+        if (need <= 1e-6) return 1.0;
+        double avail = allowedH - capOuterH;
+        if (avail >= need) return 1.0;
+        return Math.Max(0.45, Math.Min(1.0, avail / need));
+    }
+
     public static string ProcessTextWithSoftG(string input, bool useSoftG)
     {
         if (string.IsNullOrEmpty(input)) return input;
@@ -866,12 +906,14 @@ public class PigeonRingGenerator
     {
         GraphicsPath gp = new GraphicsPath();
 
-        // Eğer Türkçe karakter tiki kapalı ise fontun kendi doğal karakterini çiz:
-        if (!useTurkishFix)
-        {
-            gp.AddString(c.ToString(), ff, style, emSize, new PointF(0, 0), sf);
+        // Her zaman önce fontun kendi glifi kullanılır (harf gövdesi tam boyda kalır, aksan fontun tasarımıdır).
+        // Aksanlar banda sığmazsa CompactAccents() yalnızca aksan bölgelerini basıklaştırır.
+        gp.AddString(c.ToString(), ff, style, emSize, new PointF(0, 0), sf);
+        if (!useTurkishFix || gp.PointCount > 0)
             return gp;
-        }
+
+        // Font bu Türkçe harfi içermiyorsa: aşağıdaki yedek glifler
+        gp.Reset();
 
         // 1. Ğ glifi: G gövdesine bağlı, boyutu bozmayan kompakt şapka
         if (c == 'Ğ' || c == 'ğ')
@@ -1834,8 +1876,10 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
         double centerZLocal, double centerAngleDeg, double embedDepth, double embossHeight, double zScale,
         double charGapWorld, double targetSpanDeg = 0, double boldnessWorld = 0.0, double maxAllowedSpanDeg = 252.0,
         double verticalStretch = 1.0, bool isCircularRing = false, double circularRadiusLocal = 4.50,
-        double rootChamferWorld = 0.0, bool useTurkishFix = true, RingSurfaceSampler surfaceSampler = null)
+        double rootChamferWorld = 0.0, bool useTurkishFix = true, RingSurfaceSampler surfaceSampler = null,
+        double overhangChamferDeg = -1.0)
     {
+        if (overhangChamferDeg < 0.0) overhangChamferDeg = DefaultOverhangChamferDeg;
         SolidMesh mesh = new SolidMesh();
         if (string.IsNullOrEmpty(text)) return mesh;
 
@@ -1848,7 +1892,7 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
         StringFormat sf = StringFormat.GenericTypographic;
 
         GraphicsPath refGp = new GraphicsPath();
-        refGp.AddString("H0", ff, style, emSize, new PointF(0, 0), sf);
+        refGp.AddString("H", ff, style, emSize, new PointF(0, 0), sf);
         refGp.Flatten(null, 0.20f);
         RectangleF refBounds = refGp.GetBounds();
         double refGlyphH = refBounds.Height > 0 ? refBounds.Height : 70.0;
@@ -1881,21 +1925,62 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
 
         if (glyphChars.Count == 0) return mesh;
 
-        double textCenterY = (textMinY + textMaxY) * 0.5;
-        double textSpanH = (textMaxY > textMinY) ? (textMaxY - textMinY) : refGlyphH;
+        // "Harf boyu" = basılan BÜYÜK HARF yüksekliği (ör. H, E). Fonttan bağımsızdır.
+        // Kullanıcının "Kalınlık" payı her yöne eklendiği için boydan düşülür; dış ölçü tam ayarlanan değerdir.
+        // (Eskiden zorunlu 0.08 mm pay vardı; küçük harflerde A/B gibi iç boşlukları kapattığı için kaldırıldı.)
+        double effBoldWorld = Math.Max(0.0, boldnessWorld);
+        double glyphOnlyH = Math.Max(0.5, targetHeightWorld - 2.0 * effBoldWorld);
+        double scaleFactorWorld = glyphOnlyH / refGlyphH;
+        double boldnessLocal = (boldnessWorld > 0) ? (boldnessWorld / scaleFactorWorld) : 0;
+        double effBoldLocal = effBoldWorld / scaleFactorWorld;
 
-        double requestedH = targetHeightWorld * verticalStretch;
+        // Dikey ölçek (dünya, mm / font birimi): dış büyük harf boyu = harf boyu x dikey boy
+        double requestedOuterH = targetHeightWorld * verticalStretch;
+        double scaleYWorld = requestedOuterH / (refGlyphH + 2.0 * effBoldLocal);
+
+        // Bant sınırı: yazının toplam yüksekliği (Ç, İ, Ğ gibi aksanlar + kalınlık payı + sarkma pahı) sığmalı
         bool isSingleCentered = Math.Abs(centerZLocal) < 0.5;
         double maxAllowedPhysicalH = isSingleCentered ? 7.60 : 4.00;
-        double spanToCapRatio = textSpanH / refGlyphH;
-        if (spanToCapRatio > 1.0 && (requestedH * spanToCapRatio) > maxAllowedPhysicalH)
-            requestedH = maxAllowedPhysicalH / spanToCapRatio;
-        else if (requestedH > maxAllowedPhysicalH)
-            requestedH = maxAllowedPhysicalH;
+        double chamferAngle = (overhangChamferDeg > 0.0 && overhangChamferDeg < 89.0) ? overhangChamferDeg : 0.0;
+        double chamferWorld = (chamferAngle > 0.0 && embossHeight > 1e-4) ? embossHeight / Math.Tan(chamferAngle * Math.PI / 180.0) : 0.0;
 
-        double scaleFactorY = (requestedH / zScale) / refGlyphH;
-        double scaleFactorWorld = targetHeightWorld / refGlyphH;
-        double boldnessLocal = (boldnessWorld > 0) ? (boldnessWorld / scaleFactorWorld) : 0;
+        // Aksanlar (İ noktası, Ğ şapkası, Ç/Ş çengeli...) banda sığmıyorsa önce YALNIZCA aksanları basıklaştır;
+        // harf gövdeleri tam boyda kalır. Yine sığmazsa aşağıdaki sınır tüm yazıyı küçültür.
+        {
+            float capTop = refBounds.Top, baseline = refBounds.Bottom;
+            double aboveLocal = Math.Max(0.0, capTop - textMinY);
+            double belowLocal = Math.Max(0.0, textMaxY - baseline);
+            double k = AccentCompressionFactor(requestedOuterH, scaleYWorld * aboveLocal, scaleYWorld * belowLocal,
+                                               maxAllowedPhysicalH - chamferWorld);
+            if (k < 0.999)
+            {
+                textMinY = float.MaxValue; textMaxY = float.MinValue;
+                for (int ci = 0; ci < charGps.Count; ci++)
+                {
+                    charGps[ci] = CompactAccents(charGps[ci], capTop, baseline, (float)k);
+                    RectangleF nb = charGps[ci].GetBounds();
+                    charBounds[ci] = nb;
+                    if (nb.Y < textMinY) textMinY = nb.Y;
+                    if (nb.Bottom > textMaxY) textMaxY = nb.Bottom;
+                }
+            }
+        }
+
+        double textCenterY = (textMinY + textMaxY) * 0.5;
+        double textSpanH = (textMaxY > textMinY) ? (textMaxY - textMinY) : refGlyphH;
+        double totalOuterH = scaleYWorld * (textSpanH + 2.0 * effBoldLocal) + chamferWorld;
+        if (totalOuterH > maxAllowedPhysicalH)
+        {
+            double fitScaleY = (maxAllowedPhysicalH - chamferWorld) / (textSpanH + 2.0 * effBoldLocal);
+            double capBefore = scaleYWorld * (refGlyphH + 2.0 * effBoldLocal);
+            double capAfter = fitScaleY * (refGlyphH + 2.0 * effBoldLocal);
+            if (capBefore - capAfter >= 0.02)
+            LastTextFitNote = string.Format(CultureInfo.InvariantCulture,
+                "UYARI: '{0}' yazısı {1:F2} mm bant sınırına sığmadığı için harf boyu {2:F2} mm yerine {3:F2} mm yapıldı (aksanlar + pah dahil toplam {4:F2} mm idi).",
+                text, maxAllowedPhysicalH, capBefore, capAfter, totalOuterH);
+            scaleYWorld = fitScaleY;
+        }
+        double scaleFactorY = scaleYWorld / zScale;
 
         // 1.5 Fontun orijinal doğal karakter sınırlarını ölç
         List<RectangleF> naturalBounds;
@@ -1908,7 +1993,9 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
 
         List<double> charOriginsX = new List<double>();
         double extraGapLocal = (charGapWorld != 0) ? (charGapWorld / scaleFactorWorld) : 0;
-        double minClearanceLocal = 0.65 / scaleFactorWorld;
+        // Harfler arası asgari boşluk 0.65 mm; negatif "Harf aralığı" bu boşluğu da aynı miktarda azaltır
+        // (ör. -0.30 -> 0.35 mm). Çok negatif değerlerde harfler birbirine değebilir/binebilir.
+        double minClearanceLocal = (0.65 + Math.Min(0.0, charGapWorld)) / scaleFactorWorld;
         double prevRightWithBoldness = double.MinValue;
         double minLeftLocal = double.MaxValue;
         double maxRightLocal = double.MinValue;
@@ -1958,7 +2045,7 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
             fitRatio = maxSafeWidthWorld / textTotalWidthWorld;
             textTotalWidthWorld = maxSafeWidthWorld;
         }
-        else if (textTotalWidthWorld < maxSafeWidthWorld && textTotalWidthWorld > 0 && charOriginsX.Count > 1 && charGapWorld <= 0.05)
+        else if (textTotalWidthWorld < maxSafeWidthWorld && textTotalWidthWorld > 0 && charOriginsX.Count > 1 && charGapWorld >= 0.0 && charGapWorld <= 0.05)
         {
             double remainingWorld = maxSafeWidthWorld - textTotalWidthWorld;
             double extraPerGapWorld = remainingWorld / (charOriginsX.Count - 1);
@@ -2000,9 +2087,7 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
             GraphicsPath gp = charGps[cIdx];
             double charOriginX = charOriginsX[cIdx];
 
-            double minNozzleBoldnessWorld = 0.08;
-            double effBoldnessWorld = Math.Max(boldnessWorld, minNozzleBoldnessWorld);
-            double effBoldness = effBoldnessWorld / scaleFactorWorld;
+            double effBoldness = effBoldLocal;
 
             List<List<PointF>> allContours = BuildCleanGlyphContoursWpf(gp, effBoldness);
             if (allContours.Count == 0) continue;
@@ -2123,15 +2208,34 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
 
                 // Ön Yüz (Front: rSurf + emboss) ve Arka Kök (Back: rSurf - embed)
                 // USE SURFACE: Her (theta, z) noktası için gerçek şablon yüzeyi R_actual ölçülür!
+                //
+                // SARKMA ÖNLEYİCİ PAH: Gövdeden dışarı taşan kısım (yüzey -> ön yüz) Z ekseninde
+                // chamferShiftLocal kadar yukarı kaydırılır. Böylece harflerin alt kenarı yatay
+                // bir çıkıntı (sarkma) yerine overhangChamferDeg açılı (varsayılan 45°) eğimli bir
+                // yüzey olur. Ön yüz +shift/2, yüzey ve arka kök -shift/2 kaydırılır; yazının Z merkezi korunur.
+                double chamferShiftLocal = 0.0;
+                if (overhangChamferDeg > 0.0 && overhangChamferDeg < 89.0 && embossHeight > 1e-4)
+                    chamferShiftLocal = (embossHeight / Math.Tan(overhangChamferDeg * Math.PI / 180.0)) / Math.Max(zScale, 1e-6);
+                bool useChamfer = chamferShiftLocal > 1e-5;
+                double zFrontShift = useChamfer ? chamferShiftLocal * 0.5 : 0.0;
+                double zBackShift = useChamfer ? -chamferShiftLocal * 0.5 : 0.0;
+
+                double[] ptTheta = new double[totalPts];
+                double[] ptZ = new double[totalPts];
                 for (int k = 0; k < totalPts; k++)
                 {
                     double px = compactPts[k * 2];
                     double py = compactPts[k * 2 + 1];
                     double u = ((charOriginX + px) - localTextCenterX) * effScaleXWorld;
                     double v = -(py - textCenterY) * scaleFactorY;
+                    ptTheta[k] = centerAngleRad + u / baseR;
+                    ptZ[k] = centerZLocal + v;
+                }
 
-                    double theta = centerAngleRad + u / baseR;
-                    double z = centerZLocal + v;
+                for (int k = 0; k < totalPts; k++)
+                {
+                    double theta = ptTheta[k];
+                    double z = ptZ[k] + zFrontShift;
                     double rSurf = (surfaceSampler != null)
                         ? surfaceSampler.SampleRadius(theta, z, baseRadius)
                         : baseRadius;
@@ -2143,19 +2247,32 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                 int backOffsetLocal = glyphSolid.Vertices.Count;
                 for (int k = 0; k < totalPts; k++)
                 {
-                    double px = compactPts[k * 2];
-                    double py = compactPts[k * 2 + 1];
-                    double u = ((charOriginX + px) - localTextCenterX) * effScaleXWorld;
-                    double v = -(py - textCenterY) * scaleFactorY;
-
-                    double theta = centerAngleRad + u / baseR;
-                    double z = centerZLocal + v;
+                    double theta = ptTheta[k];
+                    double z = ptZ[k] + zBackShift;
                     double rSurf = (surfaceSampler != null)
                         ? surfaceSampler.SampleRadius(theta, z, baseRadius)
                         : baseRadius;
 
                     double rBack = rSurf - (embedDepth / xyScale);
                     glyphSolid.AddVertex(ringCenterX + rBack * Math.Cos(theta), ringCenterY + rBack * Math.Sin(theta), z);
+                }
+
+                // Pah açıkken yalnızca sınır köşeleri için gövde yüzeyinde bir ara (mid) halka kurulur.
+                Dictionary<int, int> midIndex = new Dictionary<int, int>();
+                if (useChamfer)
+                {
+                    for (int be = 0; be < boundaryEdges.Count; be++)
+                    {
+                        int bv = boundaryEdges[be];
+                        if (midIndex.ContainsKey(bv)) continue;
+                        double theta = ptTheta[bv];
+                        double z = ptZ[bv] + zBackShift;
+                        double rSurf = (surfaceSampler != null)
+                            ? surfaceSampler.SampleRadius(theta, z, baseRadius)
+                            : baseRadius;
+                        midIndex[bv] = glyphSolid.Vertices.Count;
+                        glyphSolid.AddVertex(ringCenterX + rSurf * Math.Cos(theta), ringCenterY + rSurf * Math.Sin(theta), z);
+                    }
                 }
 
                 // Ön kapak (dışa bakan)
@@ -2173,8 +2290,20 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                     int v = boundaryEdges[be + 1];
                     int f1 = u, f2 = v;
                     int b1 = backOffsetLocal + u, b2 = backOffsetLocal + v;
-                    glyphSolid.AddTriangle(f1, f2, b1);
-                    glyphSolid.AddTriangle(f2, b2, b1);
+                    if (useChamfer)
+                    {
+                        // Ön yüz -> yüzey (45° pahlı dış duvar), yüzey -> arka kök (gövde içinde radyal duvar)
+                        int m1 = midIndex[u], m2 = midIndex[v];
+                        glyphSolid.AddTriangle(f1, f2, m1);
+                        glyphSolid.AddTriangle(f2, m2, m1);
+                        glyphSolid.AddTriangle(m1, m2, b1);
+                        glyphSolid.AddTriangle(m2, b2, b1);
+                    }
+                    else
+                    {
+                        glyphSolid.AddTriangle(f1, f2, b1);
+                        glyphSolid.AddTriangle(f2, b2, b1);
+                    }
                 }
 
                 // Hacim negatif çıkarsa normalleri dışarı çevir
@@ -2615,8 +2744,9 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
             set { WidthScaleTop = value; WidthScaleBot = value; }
         }
 
-        public double EmbossMm = 0.15;
-        public double EmbedMm = 0.50;
+        public double EmbossMm = 0.20;
+        public double EmbedMm = 0.60;
+        public double OverhangChamferDeg = 0.0;
         public string Material = "PLA";
         public string SpeedProfile = "fast"; // "fast" (Hızlı Baskı) veya "slow" (Yavaş Baskı)
         public string Color1Hex = "#FFFF00";
@@ -2656,6 +2786,7 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                 "  \"speedProfile\": \"{26}\",\n" +
                 "  \"useSoftG\": {27},\n" +
                 "  \"seqLayerHeight\": {28:F2},\n" +
+                "  \"overhangChamferDeg\": {30:F1},\n" +
                 "  \"createdDate\": \"{29}\"\n" +
                 "}}",
                 Mode.ToString(),
@@ -2687,7 +2818,8 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                 EscapeJson(SpeedProfile),
                 UseSoftG ? "true" : "false",
                 SeqLayerHeight,
-                EscapeJson(CreatedDate));
+                EscapeJson(CreatedDate),
+                OverhangChamferDeg);
         }
 
         public string ToReportText(string fileName)
@@ -2739,6 +2871,9 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
             sb.AppendLine("[GEOMETRİ VE DİLİMLEME AYARLARI]");
             sb.AppendLine(string.Format(CultureInfo.InvariantCulture, "Dış Kabartma     : {0:F2} mm (Emboss)", EmbossMm));
             sb.AppendLine(string.Format(CultureInfo.InvariantCulture, "İç Gömülme       : {0:F2} mm (Embed)", EmbedMm));
+            sb.AppendLine(OverhangChamferDeg > 0.0
+                ? string.Format(CultureInfo.InvariantCulture, "Sarkma Pahı      : {0:0} derece (harf alt kenarları eğimli)", OverhangChamferDeg)
+                : "Sarkma Pahı      : 0 derece (KAPALI)");
             sb.AppendLine("Kırlangıç Kilit  : 0.20 mm (Yazı kökü gövde içinde genişler - sökülmez)");
             sb.AppendLine(string.Format("Halka Tipi       : {0}", Mode == GeneratorMode.MarkaTipi ? "Marka Tipi Dairesel Halka (310° Yay, Arkada 50° Dikiş/Seam Boşluğu)" : "Klipsli Güvercin Halkası (252° Güvenli Yay)"));
             sb.AppendLine("Toplam Halka Boyu: 9.00 mm (Tabla teması Z = 0.00 mm)");
@@ -2808,6 +2943,7 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
 
             cfg.EmbossMm = ExtractDouble(json, "embossMm", cfg.EmbossMm);
             cfg.EmbedMm = ExtractDouble(json, "embedMm", cfg.EmbedMm);
+            cfg.OverhangChamferDeg = ExtractDouble(json, "overhangChamferDeg", cfg.OverhangChamferDeg);
 
             string sSoftG = ExtractString(json, "useSoftG", "false");
             cfg.UseSoftG = string.Equals(sSoftG, "true", StringComparison.OrdinalIgnoreCase);
@@ -2997,6 +3133,11 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                         var m = System.Text.RegularExpressions.Regex.Match(v, @"([0-9\.]+)");
                         if (m.Success) double.TryParse(m.Groups[1].Value, NumberStyles.Any, CultureInfo.InvariantCulture, out cfg.EmbedMm);
                     }
+                    else if (k.Contains("Sarkma Pahı"))
+                    {
+                        var m = System.Text.RegularExpressions.Regex.Match(v, @"([0-9\.]+)");
+                        if (m.Success) double.TryParse(m.Groups[1].Value, NumberStyles.Any, CultureInfo.InvariantCulture, out cfg.OverhangChamferDeg);
+                    }
                     else if (k.Contains("Renk 1"))
                     {
                         var m = System.Text.RegularExpressions.Regex.Match(v, @"(#[0-9A-Fa-f]{6})");
@@ -3141,7 +3282,9 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
             for (int i = 0; i < labels.Count; i++)
             {
                 string lbl = labels[i];
+                LastTextFitNote = null;
                 SolidMesh tm = GenerateDistributedCylindricalText(lbl, fontName, textHeightWorld, splitZ, 236.0, embedMm, embossMm, dynZScale, charGapMm, 0, widthScale, 258.0, stretchY / 100.0, false, 0.0, 0.0, true, surfaceSampler);
+                if (LastTextFitNote != null) fullLog(LastTextFitNote);
                 textMeshes.Add(tm);
                 fullLog(string.Format("  -> [{0}/{1}] Yazı '{2}': {3} köşe, {4} üçgen", i + 1, count, lbl, tm.Vertices.Count, tm.Triangles.Count));
             }
@@ -3690,6 +3833,7 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
             seqCfg.SeqLayerHeight = layerHeight;
             seqCfg.EmbossMm = embossMm;
             seqCfg.EmbedMm = embedMm;
+            seqCfg.OverhangChamferDeg = DefaultOverhangChamferDeg;
             seqCfg.Material = material;
             seqCfg.Color1Hex = color1Hex;
             seqCfg.Color2Hex = color2Hex;
@@ -3805,6 +3949,9 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
             fullLog(string.Format("Üst Yazı: '{0}' (Font: {1}, Boy: {2:F2}mm, Dikey: %{3:0}, Gap: {4:F2}mm, Boldness: {5:F2}mm)", topText, fontTop, textHeightTopMm, stretchTop, charGapTopMm, widthScaleTop));
             fullLog(string.Format("Alt Yazı: '{0}' (Font: {1}, Boy: {2:F2}mm, Dikey: %{3:0}, Gap: {4:F2}mm, Boldness: {5:F2}mm)", botText, fontBot, textHeightBotMm, stretchBot, charGapBotMm, widthScaleBot));
             fullLog(string.Format("Geometri: Emboss={0:F2}mm, Embed={1:F2}mm, Toplam Yükseklik=9.00mm (Z=0.00mm Tabla)", embossMm, embedMm));
+            fullLog(DefaultOverhangChamferDeg > 0.0
+                ? string.Format(CultureInfo.InvariantCulture, "Sarkma Önleyici Pah: {0:0}° (harf alt kenarları eğimli, desteksiz basılır)", DefaultOverhangChamferDeg)
+                : "Sarkma Önleyici Pah: KAPALI (radyal yan duvarlar)");
 
             if (!File.Exists(backup3mf))
             {
@@ -3828,6 +3975,7 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
             currentConfig.StretchBot = stretchBot;
             currentConfig.EmbossMm = embossMm;
             currentConfig.EmbedMm = embedMm;
+            currentConfig.OverhangChamferDeg = DefaultOverhangChamferDeg;
             currentConfig.Material = matType;
             currentConfig.SpeedProfile = isFastSpeed ? "fast" : "slow";
             currentConfig.Color1Hex = color1Hex;
@@ -3895,15 +4043,23 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
             {
                 const double maxSpanMarka = 310.0;
                 const double centerAngleMarka = 234.082;
+                LastTextFitNote = null;
                 textTop = GenerateDistributedCylindricalText(topText, fontTop, textHeightTopMm, centerZTopLocal, centerAngleMarka, embedMm, embossMm, dynZScale, charGapTopMm, 0, widthScaleTop, maxSpanMarka, stretchTop / 100.0, true, 4.50, 0.0, useTurkishFix, surfaceSampler);
+                if (LastTextFitNote != null) fullLog(LastTextFitNote);
+                LastTextFitNote = null;
                 textBot = GenerateDistributedCylindricalText(botText, fontBot, textHeightBotMm, centerZBotLocal, centerAngleMarka, embedMm, embossMm, dynZScale, charGapBotMm, 0, widthScaleBot, maxSpanMarka, stretchBot / 100.0, true, 4.50, 0.0, useTurkishFix, surfaceSampler);
+                if (LastTextFitNote != null) fullLog(LastTextFitNote);
             }
             else
             {
                 const double maxSpanIsimli = 258.0;
                 const double centerAngleIsimli = 236.0;
+                LastTextFitNote = null;
                 textTop = GenerateDistributedCylindricalText(topText, fontTop, textHeightTopMm, centerZTopLocal, centerAngleIsimli, embedMm, embossMm, dynZScale, charGapTopMm, 0, widthScaleTop, maxSpanIsimli, stretchTop / 100.0, false, 0.0, 0.0, useTurkishFix, surfaceSampler);
+                if (LastTextFitNote != null) fullLog(LastTextFitNote);
+                LastTextFitNote = null;
                 textBot = GenerateDistributedCylindricalText(botText, fontBot, textHeightBotMm, centerZBotLocal, centerAngleIsimli, embedMm, embossMm, dynZScale, charGapBotMm, 0, widthScaleBot, maxSpanIsimli, stretchBot / 100.0, false, 0.0, 0.0, useTurkishFix, surfaceSampler);
+                if (LastTextFitNote != null) fullLog(LastTextFitNote);
             }
 
             double zMinTop = double.MaxValue, zMaxTop = double.MinValue;
@@ -5044,8 +5200,8 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
         private Label lblModeDesc;
 
         // İsimli & Marka Klips Kontrolleri
-        private GroupBox grpTop;
-        private GroupBox grpBot;
+        private CardPanel grpTop;
+        private CardPanel grpBot;
         private TextBox txtTopText;
         private CheckBox chkSoftG;
         private TextBox txtBotText;
@@ -5065,8 +5221,8 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
         private Button btnOpenFontsFolder;
 
         // Sıralı Klips Kontrolleri
-        private GroupBox grpSeqNums;
-        private GroupBox grpSeqFont;
+        private CardPanel grpSeqNums;
+        private CardPanel grpSeqFont;
         private Button btnPreset10;
         private Button btnPreset20;
         private Button btnPreset30;
@@ -5086,21 +5242,21 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
         private ComboBox cmbSeqLayerHeight;
 
         // Ortak Geometri, Malzeme & Renk Kontrolleri
-        private GroupBox grpParams;
+        private CardPanel grpParams;
         private NumericUpDown numEmboss;
         private NumericUpDown numEmbed;
+        private NumericUpDown numChamfer;
         private ComboBox cmbMaterial;
         private TextBox txtBakPath;
         private Button btnBrowseBak;
 
         // Önizleme & İşlem Butonları
         private DoubleBufferedPanel pnlFontPreview;
-        private GroupBox grpPreview;
+        private CardPanel grpPreview;
         private Label lblScaleInfo;
         private ComboBox cmbColorPresets;
         private Button btnColor1;
         private Button btnColor2;
-        private Label lblColorHint;
         private Button btnColor3;
         private Button btnSwapColors;
         private Color currentColor1 = Color.FromArgb(234, 179, 8); // Sarı (Extruder 1 - Alt Gövde)
@@ -5152,255 +5308,985 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
 
 
 
+        // ==========================================
+        // TASARIM SİSTEMİ (tek kaynak: renkler, yazı tipleri, ızgara)
+        // ==========================================
+        private static readonly Color UiBg = Color.FromArgb(243, 245, 249);        // pencere zemini
+        private static readonly Color UiCard = Color.White;                        // kart zemini
+        private static readonly Color UiBorder = Color.FromArgb(226, 230, 238);    // kart kenarı
+        private static readonly Color UiField = Color.FromArgb(214, 219, 228);     // girdi kenarı
+        private static readonly Color UiFieldHover = Color.FromArgb(180, 188, 202);
+        private static readonly Color UiText = Color.FromArgb(15, 23, 42);         // ana metin
+        private static readonly Color UiTextSoft = Color.FromArgb(51, 65, 85);
+        private static readonly Color UiMuted = Color.FromArgb(100, 116, 139);     // etiket / ipucu
+        private static readonly Color UiAccent = Color.FromArgb(37, 99, 235);      // ana eylem / odak
+        private static readonly Color UiAccentHover = Color.FromArgb(29, 78, 216);
+        private static readonly Color UiAccentSoft = Color.FromArgb(239, 246, 255);
+        private static readonly Color UiTrack = Color.FromArgb(236, 239, 244);     // segment zemini
+        private static readonly Color UiSuccess = Color.FromArgb(4, 120, 87);
+
+        private const string UiFontName = "Segoe UI";
+        private const string UiFontSemi = "Segoe UI Semibold";
+        private const string UiIconFont = "Segoe MDL2 Assets";
+
+        private const int UiMargin = 20;      // pencere kenar boşluğu
+        private const int UiGap = 16;         // kartlar arası boşluk
+        private const int UiPad = 20;         // kart iç boşluğu
+        private const int UiCardW = 492;      // kart genişliği (iki sütun eşit)
+        private const int UiCardH = 248;      // kart yüksekliği (tüm kartlar eşit)
+        private const int UiColGap = 12;      // ızgara sütun boşluğu
+        private const int UiColW = 104;       // 4 sütunlu ızgarada bir sütun ((492 - 2*20 - 3*12) / 4)
+        private const int UiShellH = 32;      // girdi kutusu yüksekliği
+        private static readonly int[] UiRow = { 54, 116, 178 };   // satır başları (etiket), kutu = +20
+
+        private ToolTip uiTips;
+        private DrawerPanel logDrawer;
+        private ModernButton btnShowLog;
+        private Timer logDrawerTimer;
+        private bool logDrawerOpen;
+        private int baseClientW;              // günlük kapalıyken pencere iç genişliği
+        private const int LogDrawerW = 400;   // günlük açılınca pencereye eklenen genişlik
+
+        private static Font UiF(float size, bool semibold = false)
+        {
+            return new Font(semibold ? UiFontSemi : UiFontName, size, FontStyle.Regular);
+        }
+
+        private static bool UiHasIconFont()
+        {
+            try { using (FontFamily f = new FontFamily(UiIconFont)) return true; }
+            catch { return false; }
+        }
+        private static readonly bool UiIconsAvailable = UiHasIconFont();
+
+        private static GraphicsPath UiRound(RectangleF r, float radius)
+        {
+            GraphicsPath p = new GraphicsPath();
+            float d = Math.Min(radius * 2f, Math.Min(r.Width, r.Height));
+            if (d <= 0.5f) { p.AddRectangle(r); return p; }
+            p.AddArc(r.X, r.Y, d, d, 180, 90);
+            p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            p.CloseFigure();
+            return p;
+        }
+
+        private static void UiChevronDown(Graphics g, float cx, float cy, Color c, float w = 8f)
+        {
+            using (Pen p = new Pen(c, 1.6f) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round })
+                g.DrawLines(p, new[] { new PointF(cx - w / 2f, cy - w / 4f), new PointF(cx, cy + w / 4f), new PointF(cx + w / 2f, cy - w / 4f) });
+        }
+
+        private static void UiChevronUp(Graphics g, float cx, float cy, Color c, float w = 8f)
+        {
+            using (Pen p = new Pen(c, 1.6f) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round })
+                g.DrawLines(p, new[] { new PointF(cx - w / 2f, cy + w / 4f), new PointF(cx, cy - w / 4f), new PointF(cx + w / 2f, cy + w / 4f) });
+        }
+
+        // ------------------------------------------
+        // KART: yuvarlak köşeli beyaz yüzey, başlığı kendisi çizer
+        // ------------------------------------------
+        public class CardPanel : Panel
+        {
+            public CardPanel()
+            {
+                SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.UserPaint, true);
+                BackColor = UiCard;
+            }
+
+            public override string Text
+            {
+                get { return base.Text; }
+                set { base.Text = value; Invalidate(); }
+            }
+
+            protected override void OnPaintBackground(PaintEventArgs e)
+            {
+                Graphics g = e.Graphics;
+                g.Clear(Parent != null ? Parent.BackColor : UiBg);
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                using (GraphicsPath p = UiRound(new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f), 12f))
+                {
+                    using (Brush b = new SolidBrush(UiCard)) g.FillPath(b, p);
+                    using (Pen pen = new Pen(UiBorder)) g.DrawPath(pen, p);
+                }
+                using (Font f = UiF(11f, true))
+                    TextRenderer.DrawText(g, Text, f, new Point(UiPad - 3, 17), UiText, TextFormatFlags.NoPrefix);
+            }
+        }
+
+        // ------------------------------------------
+        // GİRDİ KABI: TextBox / NumericUpDown / ComboBox için ortak yuvarlak kutu
+        // (odakta mavi çerçeve, sayılarda birim + adım okları)
+        // ------------------------------------------
+        public class InputShell : Panel
+        {
+            private readonly Control inner;
+            private readonly string unit;
+            private readonly NumericUpDown num;
+            private readonly Label unitLabel;
+            private bool hover, focused;
+            private int stepHover; // 0 yok, 1 yukarı, -1 aşağı
+            private const int StepW = 22;
+
+            public InputShell(Control innerControl, string unitText)
+            {
+                SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.UserPaint, true);
+                BackColor = UiCard;
+                inner = innerControl;
+                unit = unitText ?? "";
+                num = innerControl as NumericUpDown;
+                Cursor = Cursors.IBeam;
+
+                Controls.Add(inner);
+                if (num != null)
+                {
+                    unitLabel = new Label
+                    {
+                        Text = unit,
+                        AutoSize = false,
+                        BackColor = UiCard,
+                        ForeColor = UiMuted,
+                        Font = UiF(8.5f),
+                        TextAlign = ContentAlignment.TopRight,
+                        UseMnemonic = false
+                    };
+                    unitLabel.MouseDown += (s, e) => num.Focus();
+                    Controls.Add(unitLabel);
+                    unitLabel.BringToFront();
+                }
+                inner.GotFocus += (s, e) => { focused = true; Invalidate(); };
+                inner.LostFocus += (s, e) => { focused = false; Invalidate(); };
+                inner.MouseEnter += (s, e) => { hover = true; Invalidate(); };
+                inner.MouseLeave += (s, e) => { hover = ClientRectangle.Contains(PointToClient(Cursor.Position)); Invalidate(); };
+                inner.SizeChanged += (s, e) => LayoutInner();
+                inner.FontChanged += (s, e) => LayoutInner();
+                if (num != null)
+                {
+                    foreach (Control c in num.Controls) c.GotFocus += (s, e) => { focused = true; Invalidate(); };
+                    foreach (Control c in num.Controls) c.LostFocus += (s, e) => { focused = false; Invalidate(); };
+                }
+                if (inner is ComboBox) Cursor = Cursors.Hand;
+            }
+
+            private int UnitW()
+            {
+                if (unit.Length == 0) return 0;
+                using (Font f = UiF(8.5f)) return TextRenderer.MeasureText(unit, f).Width;
+            }
+
+            private int RightReserve()
+            {
+                if (inner is ComboBox) return 0;
+                if (num != null) return StepW + 6 + Math.Max(UnitW(), 20);
+                return 10 + (unit.Length > 0 ? UnitW() + 2 : 0);
+            }
+
+            public void LayoutInner()
+            {
+                if (inner is ComboBox)
+                {
+                    inner.SetBounds(2, Math.Max(1, (Height - inner.Height) / 2), Width - 4, inner.Height);
+                    return;
+                }
+                int x = 11;
+                int w = Math.Max(20, Width - x - RightReserve());
+                if (num != null)
+                {
+                    // NumericUpDown, gizli ok düğmeleri için sağda ~18 px boş alan ayırır; o alanı birim etiketi örter
+                    int coverW = Math.Max(UnitW(), 20);
+                    inner.SetBounds(x, (Height - inner.Height) / 2, w + 18, inner.Height);
+                    unitLabel.SetBounds(x + w, inner.Top + 2, coverW, inner.Height);
+                    unitLabel.BringToFront();
+                    return;
+                }
+                inner.SetBounds(x, (Height - inner.Height) / 2, w, inner.Height);
+            }
+
+            protected override void OnSizeChanged(EventArgs e) { base.OnSizeChanged(e); LayoutInner(); }
+            protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+            protected override void OnMouseLeave(EventArgs e) { hover = false; stepHover = 0; Invalidate(); base.OnMouseLeave(e); }
+
+            private Rectangle StepRect { get { return new Rectangle(Width - StepW - 3, 3, StepW, Height - 6); } }
+
+            protected override void OnMouseMove(MouseEventArgs e)
+            {
+                base.OnMouseMove(e);
+                int sh = 0;
+                if (num != null && StepRect.Contains(e.Location)) sh = e.Y < Height / 2 ? 1 : -1;
+                Cursor = (num != null && sh != 0) ? Cursors.Hand : (inner is ComboBox ? Cursors.Hand : Cursors.IBeam);
+                if (sh != stepHover) { stepHover = sh; Invalidate(); }
+            }
+
+            protected override void OnMouseDown(MouseEventArgs e)
+            {
+                base.OnMouseDown(e);
+                if (num != null && StepRect.Contains(e.Location))
+                {
+                    if (e.Y < Height / 2) num.UpButton(); else num.DownButton();
+                    num.Focus();
+                    return;
+                }
+                inner.Focus();
+                ComboBox cb = inner as ComboBox;
+                if (cb != null) cb.DroppedDown = true;
+            }
+
+            protected override void OnPaintBackground(PaintEventArgs e)
+            {
+                Graphics g = e.Graphics;
+                g.Clear(Parent != null ? Parent.BackColor : UiCard);
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                bool isFocused = focused || inner.ContainsFocus;
+                Color border = isFocused ? UiAccent : (hover ? UiFieldHover : UiField);
+                using (GraphicsPath p = UiRound(new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f), 8f))
+                {
+                    using (Brush b = new SolidBrush(Enabled ? UiCard : UiBg)) g.FillPath(b, p);
+                    using (Pen pen = new Pen(border, isFocused ? 1.6f : 1f)) g.DrawPath(pen, p);
+                }
+
+                int right = Width - 10;
+                if (num != null)
+                {
+                    Rectangle sr = StepRect;
+                    if (stepHover != 0)
+                    {
+                        RectangleF hr = stepHover > 0
+                            ? new RectangleF(sr.X, sr.Y, sr.Width, sr.Height / 2f)
+                            : new RectangleF(sr.X, sr.Y + sr.Height / 2f, sr.Width, sr.Height / 2f);
+                        using (GraphicsPath hp = UiRound(hr, 4f))
+                        using (Brush hb = new SolidBrush(UiTrack)) g.FillPath(hb, hp);
+                    }
+                    float cx = sr.X + sr.Width / 2f;
+                    UiChevronUp(g, cx, sr.Y + sr.Height * 0.28f, stepHover > 0 ? UiText : UiMuted, 7f);
+                    UiChevronDown(g, cx, sr.Y + sr.Height * 0.72f, stepHover < 0 ? UiText : UiMuted, 7f);
+                    right = sr.X - 2;
+                }
+                if (unit.Length > 0 && num == null)
+                {
+                    using (Font f = UiF(8.5f))
+                    {
+                        Size ts = TextRenderer.MeasureText(unit, f);
+                        TextRenderer.DrawText(g, unit, f, new Point(right - ts.Width, (Height - ts.Height) / 2), UiMuted, TextFormatFlags.NoPrefix);
+                    }
+                }
+            }
+        }
+
+        // ------------------------------------------
+        // AÇILIR LİSTE: kapalı hali ve liste öğeleri tamamen özel çizim
+        // ------------------------------------------
+        public class ModernComboBox : ComboBox
+        {
+            [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+            private struct PAINTSTRUCT
+            {
+                public IntPtr hdc; public bool fErase; public int left, top, right, bottom;
+                public bool fRestore; public bool fIncUpdate;
+                [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.ByValArray, SizeConst = 32)] public byte[] rgbReserved;
+            }
+            [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern IntPtr BeginPaint(IntPtr hWnd, out PAINTSTRUCT ps);
+            [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern bool EndPaint(IntPtr hWnd, ref PAINTSTRUCT ps);
+
+            public bool PreviewFonts;
+            private bool hover;
+            // Liste açıkken SelectedIndex fareyle gezilen satırı döndürür; tik işareti açılış anındaki seçime göre konur
+            private int committedIndex = -1;
+            private static readonly Dictionary<string, Font> fontCache = new Dictionary<string, Font>(StringComparer.OrdinalIgnoreCase);
+
+            public ModernComboBox()
+            {
+                DropDownStyle = ComboBoxStyle.DropDownList;
+                DrawMode = DrawMode.OwnerDrawVariable;
+                FlatStyle = FlatStyle.Flat;
+                Font = UiF(9.25f);
+                ItemHeight = 20;
+                DropDownHeight = 320;
+                IntegralHeight = false;
+                BackColor = UiCard;
+                ForeColor = UiText;
+            }
+
+            protected override void OnMeasureItem(MeasureItemEventArgs e)
+            {
+                e.ItemHeight = PreviewFonts ? 30 : 28;
+                base.OnMeasureItem(e);
+            }
+
+            private Font ItemFont(string name)
+            {
+                if (!PreviewFonts) return Font;
+                Font f;
+                if (fontCache.TryGetValue(name, out f)) return f;
+                try { f = CreateSafeFont(name, 10.5f); } catch { f = null; }
+                if (f == null) f = Font;
+                fontCache[name] = f;
+                return f;
+            }
+
+            protected override void OnDrawItem(DrawItemEventArgs e)
+            {
+                if (e.Index < 0) return;
+                string text = GetItemText(Items[e.Index]);
+                Graphics g = e.Graphics;
+                if ((e.State & DrawItemState.ComboBoxEdit) == DrawItemState.ComboBoxEdit)
+                {
+                    using (Brush b = new SolidBrush(UiCard)) g.FillRectangle(b, e.Bounds);
+                    TextRenderer.DrawText(g, text, Font, new Rectangle(e.Bounds.X + 7, e.Bounds.Y, e.Bounds.Width - 30, e.Bounds.Height), UiText,
+                        TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+                    return;
+                }
+                bool sel = (e.State & DrawItemState.Selected) == DrawItemState.Selected;
+                using (Brush b = new SolidBrush(UiCard)) g.FillRectangle(b, e.Bounds);
+                if (sel)
+                {
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    RectangleF r = new RectangleF(e.Bounds.X + 3, e.Bounds.Y + 1, e.Bounds.Width - 6, e.Bounds.Height - 2);
+                    using (GraphicsPath p = UiRound(r, 6f))
+                    using (Brush hb = new SolidBrush(UiAccentSoft)) g.FillPath(hb, p);
+                }
+                bool current = e.Index == (DroppedDown ? committedIndex : SelectedIndex);
+                TextRenderer.DrawText(g, text, ItemFont(text), new Rectangle(e.Bounds.X + 12, e.Bounds.Y, e.Bounds.Width - 36, e.Bounds.Height),
+                    sel ? UiAccent : UiText, TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+                if (current)
+                {
+                    using (Pen p = new Pen(UiAccent, 1.8f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                    {
+                        g.SmoothingMode = SmoothingMode.AntiAlias;
+                        float cx = e.Bounds.Right - 18, cy = e.Bounds.Y + e.Bounds.Height / 2f;
+                        g.DrawLines(p, new[] { new PointF(cx - 4, cy), new PointF(cx - 1, cy + 3), new PointF(cx + 4, cy - 3) });
+                    }
+                }
+            }
+
+            private void PaintClosed(Graphics g)
+            {
+                g.Clear(UiCard);
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                string text = SelectedIndex >= 0 ? GetItemText(SelectedItem) : Text;
+                TextRenderer.DrawText(g, text, Font, new Rectangle(8, 0, Width - 34, Height), Enabled ? UiText : UiMuted,
+                    TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+                if (DroppedDown) UiChevronUp(g, Width - 15, Height / 2f, UiAccent);
+                else UiChevronDown(g, Width - 15, Height / 2f + 0.5f, hover ? UiText : UiMuted);
+            }
+
+            protected override void WndProc(ref Message m)
+            {
+                const int WM_PAINT = 0x000F;
+                if (m.Msg == WM_PAINT)
+                {
+                    PAINTSTRUCT ps;
+                    IntPtr hdc = BeginPaint(m.HWnd, out ps);
+                    try
+                    {
+                        using (Graphics g = Graphics.FromHdc(hdc)) PaintClosed(g);
+                    }
+                    finally { EndPaint(m.HWnd, ref ps); }
+                    return;
+                }
+                base.WndProc(ref m);
+            }
+
+            protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+            protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
+            protected override void OnSelectedIndexChanged(EventArgs e) { Invalidate(); base.OnSelectedIndexChanged(e); }
+            protected override void OnDropDown(EventArgs e) { committedIndex = SelectedIndex; Invalidate(); base.OnDropDown(e); }
+            protected override void OnDropDownClosed(EventArgs e) { Invalidate(); if (Parent != null) Parent.Invalidate(); base.OnDropDownClosed(e); }
+            protected override void OnGotFocus(EventArgs e) { Invalidate(); base.OnGotFocus(e); }
+            protected override void OnLostFocus(EventArgs e) { Invalidate(); base.OnLostFocus(e); }
+        }
+
+        // ------------------------------------------
+        // DÜĞME: ana / ikincil / sade / segment türleri, yuvarlak köşe, simge desteği
+        // ------------------------------------------
+        public enum ButtonKind { Primary, Secondary, Ghost, Segment }
+
+        public class ModernButton : Button
+        {
+            public ButtonKind Kind = ButtonKind.Secondary;
+            public string Icon = "";
+            private bool active;
+            private bool hover, pressed;
+
+            public bool Active { get { return active; } set { active = value; Invalidate(); } }
+
+            public ModernButton()
+            {
+                SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+                FlatStyle = FlatStyle.Flat;
+                FlatAppearance.BorderSize = 0;
+                Cursor = Cursors.Hand;
+                UseMnemonic = false;
+                Font = UiF(9f);
+            }
+
+            protected override bool ShowFocusCues { get { return false; } }
+            protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+            protected override void OnMouseLeave(EventArgs e) { hover = false; pressed = false; Invalidate(); base.OnMouseLeave(e); }
+            protected override void OnMouseDown(MouseEventArgs e) { pressed = true; Invalidate(); base.OnMouseDown(e); }
+            protected override void OnMouseUp(MouseEventArgs e) { pressed = false; Invalidate(); base.OnMouseUp(e); }
+            protected override void OnEnabledChanged(EventArgs e) { Invalidate(); base.OnEnabledChanged(e); }
+            protected override void OnTextChanged(EventArgs e) { Invalidate(); base.OnTextChanged(e); }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                Graphics g = e.Graphics;
+                g.Clear(Parent != null ? Parent.BackColor : UiCard);
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+
+                Color fill = Color.Empty, border = Color.Empty, fg = UiTextSoft;
+                float radius = 8f;
+                Font font = Font;
+                bool disposeFont = false;
+                switch (Kind)
+                {
+                    case ButtonKind.Primary:
+                        fill = !Enabled ? Color.FromArgb(147, 177, 238) : (pressed ? Color.FromArgb(30, 64, 175) : (hover ? UiAccentHover : UiAccent));
+                        fg = Color.White; radius = 10f;
+                        font = UiF(Font.Size, true); disposeFont = true;
+                        break;
+                    case ButtonKind.Secondary:
+                        fill = pressed ? UiTrack : (hover ? Color.FromArgb(248, 250, 252) : UiCard);
+                        border = hover ? UiFieldHover : UiField;
+                        fg = Enabled ? UiTextSoft : UiMuted;
+                        break;
+                    case ButtonKind.Ghost:
+                        fill = pressed ? Color.FromArgb(226, 232, 240) : (hover ? UiTrack : Color.Empty);
+                        fg = Enabled ? UiTextSoft : UiMuted;
+                        break;
+                    case ButtonKind.Segment:
+                        if (active) { fill = UiCard; fg = UiText; font = UiF(Font.Size, true); disposeFont = true; }
+                        else { fill = hover ? Color.FromArgb(226, 231, 239) : Color.Empty; fg = hover ? UiText : UiMuted; }
+                        radius = 7f;
+                        break;
+                }
+
+                RectangleF r = new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f);
+                if (Kind == ButtonKind.Segment && active)
+                {
+                    using (GraphicsPath sp = UiRound(new RectangleF(r.X, r.Y + 1f, r.Width, r.Height), radius))
+                    using (Brush sb = new SolidBrush(Color.FromArgb(28, 15, 23, 42))) g.FillPath(sb, sp);
+                    r = new RectangleF(r.X, r.Y, r.Width, r.Height - 1f);
+                }
+                using (GraphicsPath p = UiRound(r, radius))
+                {
+                    if (fill != Color.Empty) using (Brush b = new SolidBrush(fill)) g.FillPath(b, p);
+                    if (border != Color.Empty) using (Pen pen = new Pen(border)) g.DrawPath(pen, p);
+                }
+
+                bool hasIcon = UiIconsAvailable && !string.IsNullOrEmpty(Icon);
+                using (Font iconFont = hasIcon ? new Font(UiIconFont, Kind == ButtonKind.Primary ? 11f : 9.5f) : null)
+                {
+                    TextFormatFlags flags = TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding;
+                    Size ts = TextRenderer.MeasureText(g, Text, font, Size.Empty, flags);
+                    Size isz = hasIcon ? TextRenderer.MeasureText(g, Icon, iconFont, Size.Empty, flags) : Size.Empty;
+                    int gap = (hasIcon && Text.Length > 0) ? 7 : 0;
+                    int total = isz.Width + gap + ts.Width;
+                    int x = (Width - total) / 2;
+                    if (hasIcon)
+                    {
+                        TextRenderer.DrawText(g, Icon, iconFont, new Point(x, (Height - isz.Height) / 2 + 1), fg, flags);
+                        x += isz.Width + gap;
+                    }
+                    TextRenderer.DrawText(g, Text, font, new Point(x, (Height - ts.Height) / 2), fg, flags);
+                }
+                if (disposeFont) font.Dispose();
+            }
+        }
+
+        // ------------------------------------------
+        // RENK ÇİPİ: daire, rengi BackColor'dan okur
+        // ------------------------------------------
+        public class SwatchButton : Button
+        {
+            private bool hover;
+            public string Caption = "";
+            public SwatchButton()
+            {
+                SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint, true);
+                FlatStyle = FlatStyle.Flat;
+                FlatAppearance.BorderSize = 0;
+                Cursor = Cursors.Hand;
+            }
+            protected override bool ShowFocusCues { get { return false; } }
+            protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+            protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
+            protected override void OnBackColorChanged(EventArgs e) { Invalidate(); base.OnBackColorChanged(e); }
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                Graphics g = e.Graphics;
+                g.Clear(Parent != null ? Parent.BackColor : UiCard);
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                float d = Math.Min(Width, Height) - 2f;
+                RectangleF outer = new RectangleF((Width - d) / 2f, (Height - d) / 2f, d, d);
+                using (Pen ring = new Pen(hover ? UiAccent : UiField, hover ? 2f : 1f)) g.DrawEllipse(ring, outer);
+                RectangleF inner = RectangleF.Inflate(outer, -3.5f, -3.5f);
+                using (Brush b = new SolidBrush(BackColor)) g.FillEllipse(b, inner);
+                using (Pen p = new Pen(Color.FromArgb(40, 0, 0, 0))) g.DrawEllipse(p, inner);
+                if (Caption.Length > 0)
+                {
+                    bool light = (BackColor.R * 0.299 + BackColor.G * 0.587 + BackColor.B * 0.114) > 150;
+                    using (Font f = UiF(7f, true))
+                        TextRenderer.DrawText(g, Caption, f, Rectangle.Round(inner), light ? UiText : Color.White,
+                            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding);
+                }
+            }
+        }
+
+        // ------------------------------------------
+        // AÇMA/KAPAMA ANAHTARI (CheckBox tabanlı)
+        // ------------------------------------------
+        public class ToggleSwitch : CheckBox
+        {
+            private bool hover;
+            public ToggleSwitch()
+            {
+                SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+                Cursor = Cursors.Hand;
+                AutoSize = false;
+                Font = UiF(9f);
+                UseMnemonic = false;
+            }
+            protected override bool ShowFocusCues { get { return false; } }
+            public int PreferredW
+            {
+                get { using (Graphics g = CreateGraphics()) return 44 + TextRenderer.MeasureText(g, Text, Font).Width; }
+            }
+            protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+            protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
+            protected override void OnCheckedChanged(EventArgs e) { Invalidate(); base.OnCheckedChanged(e); }
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                Graphics g = e.Graphics;
+                g.Clear(Parent != null ? Parent.BackColor : UiCard);
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                RectangleF track = new RectangleF(1, (Height - 20) / 2f, 36, 20);
+                using (GraphicsPath p = UiRound(track, 10f))
+                using (Brush b = new SolidBrush(Checked ? (hover ? UiAccentHover : UiAccent) : (hover ? Color.FromArgb(186, 194, 208) : Color.FromArgb(203, 210, 222))))
+                    g.FillPath(b, p);
+                float kx = Checked ? track.Right - 18f : track.X + 2f;
+                using (Brush sh = new SolidBrush(Color.FromArgb(40, 0, 0, 0))) g.FillEllipse(sh, kx, track.Y + 2.6f, 16, 16);
+                g.FillEllipse(Brushes.White, kx, track.Y + 2f, 16, 16);
+                TextRenderer.DrawText(g, Text, Font, new Rectangle(44, 0, Width - 44, Height), UiTextSoft,
+                    TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
+            }
+        }
+
+        // ------------------------------------------
+        // SEGMENT: gri zemin üzerinde hap şeklinde seçenekler
+        // ------------------------------------------
+        public class SegmentTrack : Panel
+        {
+            public SegmentTrack()
+            {
+                SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+                BackColor = UiTrack;
+            }
+            protected override void OnPaintBackground(PaintEventArgs e)
+            {
+                Graphics g = e.Graphics;
+                g.Clear(Parent != null ? Parent.BackColor : UiCard);
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                using (GraphicsPath p = UiRound(new RectangleF(0, 0, Width - 0.5f, Height - 0.5f), 9f))
+                using (Brush b = new SolidBrush(UiTrack)) g.FillPath(b, p);
+            }
+        }
+
+        public class SegmentRadio : RadioButton
+        {
+            private bool hover;
+            public SegmentRadio()
+            {
+                SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+                Cursor = Cursors.Hand;
+                AutoSize = false;
+                Font = UiF(9f);
+                UseMnemonic = false;
+            }
+            protected override bool ShowFocusCues { get { return false; } }
+            protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+            protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
+            protected override void OnCheckedChanged(EventArgs e) { Invalidate(); base.OnCheckedChanged(e); }
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                Graphics g = e.Graphics;
+                g.Clear(Parent != null ? Parent.BackColor : UiTrack);
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                if (Checked)
+                {
+                    using (GraphicsPath sp = UiRound(new RectangleF(0.5f, 1.5f, Width - 1.5f, Height - 2f), 7f))
+                    using (Brush sb = new SolidBrush(Color.FromArgb(28, 15, 23, 42))) g.FillPath(sb, sp);
+                    using (GraphicsPath p = UiRound(new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 2f), 7f))
+                        g.FillPath(Brushes.White, p);
+                }
+                using (Font f = Checked ? UiF(Font.Size, true) : UiF(Font.Size))
+                    TextRenderer.DrawText(g, Text, f, new Rectangle(0, 0, Width, Height - 1), Checked ? UiText : (hover ? UiText : UiMuted),
+                        TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+            }
+        }
+
+        // ------------------------------------------
+        // HAP ETİKET: vurgulu bilgi (ör. toplam klips sayısı)
+        // ------------------------------------------
+        public class PillLabel : Label
+        {
+            public PillLabel()
+            {
+                SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint, true);
+                UseMnemonic = false;
+            }
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                Graphics g = e.Graphics;
+                g.Clear(Parent != null ? Parent.BackColor : UiCard);
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                using (GraphicsPath p = UiRound(new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f), 8f))
+                using (Brush b = new SolidBrush(UiAccentSoft)) g.FillPath(b, p);
+                TextRenderer.DrawText(g, Text, Font, new Rectangle(12, 0, Width - 24, Height), UiAccent,
+                    TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
+            }
+        }
+
+        // ------------------------------------------
+        // ÜST / ALT BAR: düz beyaz şerit, ince ayırıcı çizgi
+        // ------------------------------------------
+        public class DrawerPanel : Panel
+        {
+            public DrawerPanel()
+            {
+                SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+                BackColor = UiCard;
+            }
+            protected override void OnPaintBackground(PaintEventArgs e)
+            {
+                e.Graphics.Clear(UiCard);
+                using (Pen p = new Pen(UiBorder)) e.Graphics.DrawLine(p, 0, 0, 0, Height);
+            }
+        }
+
+        public class BarPanel : Panel
+        {
+            public bool LineAtBottom = true;
+            public BarPanel()
+            {
+                SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+                BackColor = UiCard;
+            }
+            protected override void OnPaintBackground(PaintEventArgs e)
+            {
+                e.Graphics.Clear(UiCard);
+                using (Pen p = new Pen(UiBorder))
+                {
+                    int y = LineAtBottom ? Height - 1 : 0;
+                    e.Graphics.DrawLine(p, 0, y, Width, y);
+                }
+            }
+        }
+
+        // ==========================================
+        // YERLEŞİM YARDIMCILARI
+        // ==========================================
+        private static int UiCol(int i) { return UiPad + i * (UiColW + UiColGap); }
+        private static int UiSpan(int cols) { return cols * UiColW + (cols - 1) * UiColGap; }
+        private static int UiShellY(int row) { return UiRow[row] + 20; }
+
+        private CardPanel UiMakeCard(string title, int x, int y)
+        {
+            CardPanel c = new CardPanel { Text = title, Location = new Point(x, y), Size = new Size(UiCardW, UiCardH) };
+            this.Controls.Add(c);
+            return c;
+        }
+
+        private Label UiLabel(Control parent, string text, int x, int y, int w)
+        {
+            Label l = new Label
+            {
+                Text = text,
+                Location = new Point(x, y),
+                Size = new Size(w, 17),
+                Font = UiF(8.5f),
+                ForeColor = UiMuted,
+                UseMnemonic = false,
+                AutoEllipsis = true
+            };
+            parent.Controls.Add(l);
+            return l;
+        }
+
+        private InputShell UiShell(Control parent, Control inner, string unit, int x, int y, int w, int h = UiShellH)
+        {
+            InputShell s = new InputShell(inner, unit) { Location = new Point(x, y), Size = new Size(w, h) };
+            parent.Controls.Add(s);
+            s.LayoutInner();
+            return s;
+        }
+
+        private NumericUpDown UiNumber(Control parent, string label, string unit, int col, int row, decimal min, decimal max, decimal value, int decimals, decimal step)
+        {
+            UiLabel(parent, label, UiCol(col), UiRow[row], UiColW);
+            NumericUpDown n = new NumericUpDown
+            {
+                Minimum = min,
+                Maximum = max,
+                Value = value,
+                DecimalPlaces = decimals,
+                Increment = step,
+                BorderStyle = BorderStyle.None,
+                Font = UiF(9.5f),
+                ForeColor = UiText,
+                BackColor = UiCard
+            };
+            if (n.Controls.Count > 0) n.Controls[0].Visible = false;   // yerel ok düğmeleri gizli, kab kendi oklarını çizer
+            UiShell(parent, n, unit, UiCol(col), UiShellY(row), UiColW);
+            return n;
+        }
+
+        private ModernComboBox UiCombo(Control parent, int x, int y, int w, bool previewFonts = false)
+        {
+            ModernComboBox c = new ModernComboBox { PreviewFonts = previewFonts, Width = w - 4 };
+            if (previewFonts) c.DropDownWidth = Math.Max(w, 260);
+            UiShell(parent, c, "", x, y, w);
+            return c;
+        }
+
+        private TextBox UiTextBox(Control parent, int x, int y, int w, int h = UiShellH, float fontSize = 9.5f)
+        {
+            TextBox t = new TextBox { BorderStyle = BorderStyle.None, Font = UiF(fontSize), ForeColor = UiText, BackColor = UiCard };
+            UiShell(parent, t, "", x, y, w, h);
+            return t;
+        }
+
+        private ModernButton UiButton(Control parent, string text, string icon, ButtonKind kind, int x, int y, int w, int h)
+        {
+            ModernButton b = new ModernButton { Text = text, Icon = icon, Kind = kind, Location = new Point(x, y), Size = new Size(w, h) };
+            parent.Controls.Add(b);
+            return b;
+        }
+
+        private SwatchButton UiSwatch(Control parent, int x, int y, Color c, string caption, EventHandler onClick, string tip)
+        {
+            SwatchButton b = new SwatchButton { Location = new Point(x, y), Size = new Size(UiShellH, UiShellH), BackColor = c, Caption = caption };
+            b.Click += onClick;
+            uiTips.SetToolTip(b, tip);
+            parent.Controls.Add(b);
+            return b;
+        }
+
+        private void ShowLogWindow() { SetLogDrawer(true); }
+
+        private void SetLogDrawer(bool open)
+        {
+            if (logDrawer == null || logDrawerOpen == open) return;
+            logDrawerOpen = open;
+            if (open)
+            {
+                // Pencere ekranın sağından taşacaksa önce sola kaydır
+                Rectangle wa = Screen.FromControl(this).WorkingArea;
+                if (this.Left + this.Width - this.ClientSize.Width + baseClientW + LogDrawerW > wa.Right)
+                    this.Left = Math.Max(wa.Left, wa.Right - (this.Width - this.ClientSize.Width) - baseClientW - LogDrawerW);
+                logDrawer.Visible = true;
+            }
+            logDrawerTimer.Start();
+        }
+
+        private void LogDrawerTimer_Tick(object sender, EventArgs e)
+        {
+            int target = baseClientW + (logDrawerOpen ? LogDrawerW : 0);
+            int cur = this.ClientSize.Width;
+            if (cur == target) { logDrawerTimer.Stop(); return; }
+            int step = Math.Max(12, Math.Abs(target - cur) / 3);
+            int next = cur < target ? Math.Min(target, cur + step) : Math.Max(target, cur - step);
+            this.ClientSize = new Size(next, this.ClientSize.Height);
+            if (next == target)
+            {
+                logDrawerTimer.Stop();
+                if (logDrawerOpen) { txtLog.SelectionStart = txtLog.TextLength; txtLog.ScrollToCaret(); }
+                else logDrawer.Visible = false;
+            }
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            // Kartların altına yumuşak gölge
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            foreach (Control c in this.Controls)
+            {
+                if (!(c is CardPanel) || !c.Visible) continue;
+                for (int i = 3; i >= 1; i--)
+                {
+                    RectangleF r = new RectangleF(c.Left - i + 1, c.Top - i + 3, c.Width + 2 * i - 2, c.Height + 2 * i - 2);
+                    using (GraphicsPath p = UiRound(r, 12f + i))
+                    using (Brush b = new SolidBrush(Color.FromArgb(7, 15, 23, 42))) g.FillPath(b, p);
+                }
+            }
+        }
+
         private void InitializeComponent()
         {
-            this.Text = "Snapmaker U1 Güvercin Halkası 3MF Oluşturucu [PER-GLYPH]";
-            this.ClientSize = new Size(960, 690);
-            this.MinimumSize = new Size(960, 690);
+            const int headerH = 68;
+            const int footerH = 76;
+            int clientW = UiMargin + UiCardW + UiGap + UiCardW + UiMargin;   // 1040
+            int yA = headerH + UiMargin;
+            int yB = yA + UiCardH + UiGap;
+            int clientH = yB + UiCardH + UiMargin + footerH;                 // 696
+            int xL = UiMargin;
+            int xR = UiMargin + UiCardW + UiGap;
+            int inW = UiCardW - 2 * UiPad;                                   // kart iç genişliği (452)
+
+            this.Text = "Güvercin Halkası 3MF Üretici";
+            this.ClientSize = new Size(clientW, clientH);
+            this.FormBorderStyle = FormBorderStyle.FixedSingle;
+            this.MaximizeBox = false;
             this.StartPosition = FormStartPosition.CenterScreen;
-            this.Font = new Font("Segoe UI", 9f, FontStyle.Regular);
-            this.BackColor = Color.FromArgb(248, 250, 252);
-            this.ForeColor = Color.FromArgb(15, 23, 42);
+            this.Font = UiF(9f);
+            this.BackColor = UiBg;
+            this.ForeColor = UiText;
+            this.DoubleBuffered = true;
+
+            uiTips = new ToolTip { AutoPopDelay = 15000, InitialDelay = 400 };
 
             // ==========================================
-            // 1. HEADER BAR (Kompakt koyu lacivert bar)
+            // ÜST BAR: logo, başlık, mod açıklaması, mod seçici
             // ==========================================
-            Panel pnlHeader = new Panel();
-            pnlHeader.Dock = DockStyle.Top;
-            pnlHeader.Height = 38;
-            pnlHeader.BackColor = Color.FromArgb(15, 23, 42);
-            pnlHeader.Padding = new Padding(14, 0, 14, 0);
+            BarPanel pnlHeader = new BarPanel { Dock = DockStyle.Top, Height = headerH, LineAtBottom = true };
+            this.Controls.Add(pnlHeader);
 
-            Label lblTitle = new Label();
-            lblTitle.Text = "GÜVERCİN HALKASI 3MF MODEL ÜRETİCİ";
-            lblTitle.Font = new Font("Segoe UI", 10.5f, FontStyle.Bold);
-            lblTitle.ForeColor = Color.White;
-            lblTitle.AutoSize = true;
-            lblTitle.Location = new Point(14, 9);
+            Panel logo = new Panel { Location = new Point(UiMargin, 16), Size = new Size(36, 36), BackColor = UiCard };
+            logo.Paint += (s, e) =>
+            {
+                Graphics g = e.Graphics;
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.Clear(UiCard);
+                using (GraphicsPath p = UiRound(new RectangleF(0, 0, 35.5f, 35.5f), 10f))
+                using (Brush b = new LinearGradientBrush(new Rectangle(0, 0, 36, 36), Color.FromArgb(59, 130, 246), Color.FromArgb(29, 78, 216), 45f))
+                    g.FillPath(b, p);
+                using (Pen ring = new Pen(Color.White, 3f)) g.DrawEllipse(ring, 9.5f, 9.5f, 17f, 17f);
+                using (Pen band = new Pen(Color.FromArgb(150, 255, 255, 255), 1.5f)) g.DrawLine(band, 9.5f, 18f, 26.5f, 18f);
+            };
+            pnlHeader.Controls.Add(logo);
+
+            Label lblTitle = new Label
+            {
+                Text = "Güvercin Halkası Üretici",
+                Location = new Point(UiMargin + 48, 13),
+                AutoSize = true,
+                Font = UiF(12.5f, true),
+                ForeColor = UiText,
+                BackColor = UiCard,
+                UseMnemonic = false
+            };
             pnlHeader.Controls.Add(lblTitle);
-
-            Label lblSubTitle = new Label();
-            lblSubTitle.Text = "Snapmaker U1 / OrcaSlicer • Manifold 3D Katı Model • Z = 0.00 mm Tabla Hizalı";
-            lblSubTitle.Font = new Font("Segoe UI", 8f, FontStyle.Regular);
-            lblSubTitle.ForeColor = Color.FromArgb(148, 163, 184);
-            lblSubTitle.AutoSize = false;
-            lblSubTitle.Dock = DockStyle.Right;
-            lblSubTitle.Width = 520;
-            lblSubTitle.TextAlign = ContentAlignment.MiddleRight;
-            lblSubTitle.Padding = new Padding(0, 0, 14, 0);
-            pnlHeader.Controls.Add(lblSubTitle);
-
-            // ==========================================
-            // 2. TOP MODE BAR (İSİMLİ KLİPS - SIRALI KLİPS - MARKA TİPİ)
-            // ==========================================
-            Panel pnlModeBar = new Panel();
-            pnlModeBar.Dock = DockStyle.Top;
-            pnlModeBar.Height = 46;
-            pnlModeBar.BackColor = Color.FromArgb(241, 245, 249);
-            pnlModeBar.Padding = new Padding(10, 6, 10, 6);
-
-            btnModeIsimli = new Button
-            {
-                Text = "●  İSİMLİ KLİPS",
-                Location = new Point(10, 7),
-                Size = new Size(150, 32),
-                Font = new Font("Segoe UI", 9f, FontStyle.Bold),
-                FlatStyle = FlatStyle.Flat,
-                Cursor = Cursors.Hand
-            };
-            btnModeIsimli.FlatAppearance.BorderSize = 0;
-            btnModeIsimli.Click += (s, e) => SetMode(GeneratorMode.IsimliKlips);
-            pnlModeBar.Controls.Add(btnModeIsimli);
-
-            btnModeSirali = new Button
-            {
-                Text = "●  SIRALI KLİPS",
-                Location = new Point(166, 7),
-                Size = new Size(150, 32),
-                Font = new Font("Segoe UI", 9f, FontStyle.Bold),
-                FlatStyle = FlatStyle.Flat,
-                Cursor = Cursors.Hand
-            };
-            btnModeSirali.FlatAppearance.BorderSize = 0;
-            btnModeSirali.Click += (s, e) => SetMode(GeneratorMode.SiraliKlips);
-            pnlModeBar.Controls.Add(btnModeSirali);
-
-            btnModeMarka = new Button
-            {
-                Text = "●  MARKA TİPİ (YUVARLAK)",
-                Location = new Point(322, 7),
-                Size = new Size(200, 32),
-                Font = new Font("Segoe UI", 9f, FontStyle.Bold),
-                FlatStyle = FlatStyle.Flat,
-                Cursor = Cursors.Hand
-            };
-            btnModeMarka.FlatAppearance.BorderSize = 0;
-            btnModeMarka.Click += (s, e) => SetMode(GeneratorMode.MarkaTipi);
-            pnlModeBar.Controls.Add(btnModeMarka);
 
             lblModeDesc = new Label
             {
-                Location = new Point(530, 13),
-                Size = new Size(415, 20),
-                Font = new Font("Segoe UI", 8.25f, FontStyle.Regular),
-                ForeColor = Color.FromArgb(71, 85, 105),
-                Text = "Kişiye özel tekli çift renkli klipsli halka (İsim Soyisim + Telefon No)"
+                Location = new Point(UiMargin + 50, 38),
+                Size = new Size(520, 18),
+                Font = UiF(8.75f),
+                ForeColor = UiMuted,
+                BackColor = UiCard,
+                UseMnemonic = false,
+                AutoEllipsis = true
             };
-            pnlModeBar.Controls.Add(lblModeDesc);
+            pnlHeader.Controls.Add(lblModeDesc);
+
+            const int segW = 118, segH = 32;
+            SegmentTrack modeTrack = new SegmentTrack { Size = new Size(3 * segW + 8, segH + 8) };
+            modeTrack.Location = new Point(clientW - UiMargin - modeTrack.Width, (headerH - modeTrack.Height) / 2);
+            pnlHeader.Controls.Add(modeTrack);
+            btnModeIsimli = UiButton(modeTrack, "İsimli Klips", "", ButtonKind.Segment, 4, 4, segW, segH);
+            btnModeSirali = UiButton(modeTrack, "Sıralı Klips", "", ButtonKind.Segment, 4 + segW, 4, segW, segH);
+            btnModeMarka = UiButton(modeTrack, "Marka Tipi", "", ButtonKind.Segment, 4 + 2 * segW, 4, segW, segH);
+            btnModeIsimli.Click += (s, e) => SetMode(GeneratorMode.IsimliKlips);
+            btnModeSirali.Click += (s, e) => SetMode(GeneratorMode.SiraliKlips);
+            btnModeMarka.Click += (s, e) => SetMode(GeneratorMode.MarkaTipi);
 
             // ==========================================
-            // 3. MAIN BODY CONTAINER
+            // ALT BAR: hız, dosya işlemleri, ana eylem
             // ==========================================
-            Panel pnlBody = new Panel();
-            pnlBody.Dock = DockStyle.Fill;
-            pnlBody.Padding = new Padding(10);
-            pnlBody.AutoScroll = false;
+            BarPanel pnlFooter = new BarPanel { Dock = DockStyle.Bottom, Height = footerH, LineAtBottom = false };
+            this.Controls.Add(pnlFooter);
 
-            this.Controls.Add(pnlBody);
-            this.Controls.Add(pnlModeBar);
-            this.Controls.Add(pnlHeader);
-            pnlBody.BringToFront();
+            Label lblSpeed = new Label { Text = "Baskı hızı", Location = new Point(UiMargin, 29), AutoSize = true, Font = UiF(8.75f), ForeColor = UiMuted, BackColor = UiCard };
+            pnlFooter.Controls.Add(lblSpeed);
+            SegmentTrack speedTrack = new SegmentTrack { Location = new Point(UiMargin + 72, 18), Size = new Size(172, 40) };
+            pnlFooter.Controls.Add(speedTrack);
+            rbSpeedFast = new SegmentRadio { Text = "Hızlı", Location = new Point(4, 4), Size = new Size(82, 32), Checked = true };
+            rbSpeedSlow = new SegmentRadio { Text = "Yavaş", Location = new Point(86, 4), Size = new Size(82, 32) };
+            speedTrack.Controls.Add(rbSpeedFast);
+            speedTrack.Controls.Add(rbSpeedSlow);
+            uiTips.SetToolTip(rbSpeedFast, "Standart hızlar: 50 / 80 / 300 mm/s");
+            uiTips.SetToolTip(rbSpeedSlow, "Yavaş ve güvenli ilk katman: 18 / 30 / 45 mm/s");
 
-            // ------------------------------------------
-            // SOL KOLON: GİRDİ VE AYARLAR (Width: 460)
-            // ------------------------------------------
+            int fx = UiMargin + 72 + 172 + 24;
+            btnOpenOrca = UiButton(pnlFooter, "OrcaSlicer", "", ButtonKind.Ghost, fx, 20, 108, 36); fx += 108 + 4;
+            btnOpenFolder = UiButton(pnlFooter, "Klasör", "", ButtonKind.Ghost, fx, 20, 84, 36); fx += 84 + 4;
+            btnLoad3mf = UiButton(pnlFooter, "Ayar Yükle", "", ButtonKind.Ghost, fx, 20, 106, 36); fx += 106 + 4;
+            btnViewInfo = UiButton(pnlFooter, "Rapor", "", ButtonKind.Ghost, fx, 20, 80, 36); fx += 80 + 4;
+            btnShowLog = UiButton(pnlFooter, "Günlük", "", ButtonKind.Ghost, fx, 20, 86, 36);
+            btnOpenOrca.Click += BtnOpenOrca_Click;
+            btnOpenFolder.Click += BtnOpenFolder_Click;
+            btnLoad3mf.Click += BtnLoad3mf_Click;
+            btnViewInfo.Click += BtnViewInfo_Click;
+            btnShowLog.Click += (s, e) => SetLogDrawer(!logDrawerOpen);
+            uiTips.SetToolTip(btnOpenOrca, "Son üretilen dosyayı OrcaSlicer'da açar.");
+            uiTips.SetToolTip(btnOpenFolder, "Son üretilen dosyanın klasörünü açar.");
+            uiTips.SetToolTip(btnLoad3mf, "Daha önce üretilmiş bir .3mf dosyasının ayarlarını geri yükler.");
+            uiTips.SetToolTip(btnViewInfo, "Son üretilen dosyanın _bilgi.txt raporunu açar.");
+            uiTips.SetToolTip(btnShowLog, "İşlem günlüğünü açar / kapatır (Esc ile kapanır).");
 
-            // [A] İSİMLİ & MARKA İÇİN: 1. ÜST BÖLÜM
-            grpTop = new GroupBox();
-            grpTop.Text = " 1. Üst Bölüm (İsim Soyisim) Ayarları ";
-            grpTop.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
-            grpTop.Location = new Point(10, 6);
-            grpTop.Size = new Size(460, 172);
-            pnlBody.Controls.Add(grpTop);
+            btnGenerate = UiButton(pnlFooter, "3MF Oluştur", "", ButtonKind.Primary, clientW - UiMargin - 220, 14, 220, 48);
+            btnGenerate.Font = UiF(10.5f, true);
+            btnGenerate.Click += BtnGenerate_Click;
 
-            Label lblTop = new Label { Text = "Üst Yazı (İsim / Marka):", Location = new Point(12, 22), AutoSize = true, Font = new Font("Segoe UI", 8f) };
-            txtTopText = new TextBox { Location = new Point(12, 40), Size = new Size(300, 24), Font = new Font("Segoe UI", 10f, FontStyle.Bold), Text = "G.CIVAN" };
-            txtTopText.TextChanged += TxtTopText_TextChanged;
-            grpTop.Controls.Add(lblTop);
-            grpTop.Controls.Add(txtTopText);
+            // ==========================================
+            // SOL ÜST: ÜST YAZI
+            // ==========================================
+            grpTop = UiMakeCard("Üst Yazı", xL, yA);
 
-            chkSoftG = new CheckBox
-            {
-                Text = "Türkçe Harf Desteği (Kopmayan Manifold Glifler: Ğ, Ş, Ç, İ, Ö, Ü)",
-                Location = new Point(145, 20),
-                AutoSize = true,
-                Font = new Font("Segoe UI", 8.25f, FontStyle.Bold),
-                ForeColor = Color.FromArgb(220, 38, 38),
-                Checked = false,
-                Cursor = Cursors.Hand
-            };
-            chkSoftG.CheckedChanged += (s, e) =>
-            {
-                UpdateFontPreview();
-            };
+            ToggleSwitch tgSoftG = new ToggleSwitch { Text = "Türkçe harf desteği" };
+            chkSoftG = tgSoftG;
             grpTop.Controls.Add(chkSoftG);
+            chkSoftG.Size = new Size(tgSoftG.PreferredW, 24);
+            chkSoftG.Location = new Point(UiCardW - UiPad - chkSoftG.Width, 15);
+            chkSoftG.CheckedChanged += (s, e) => UpdateFontPreview();
+            uiTips.SetToolTip(chkSoftG, "Ğ, Ş, Ç, İ, Ö, Ü harflerini kopmayan tek parça (manifold) glif olarak üretir.");
 
-            Label lblFilter = new Label { Text = "Font Filtrele:", Location = new Point(320, 22), AutoSize = true, Font = new Font("Segoe UI", 8f) };
-            txtFontFilter = new TextBox { Location = new Point(320, 40), Size = new Size(126, 23), Font = new Font("Segoe UI", 8.5f) };
-            grpTop.Controls.Add(lblFilter);
-            grpTop.Controls.Add(txtFontFilter);
+            txtTopText = UiTextBox(grpTop, UiPad, UiRow[0], inW, 52, 13f);
+            txtTopText.Text = "G.CIVAN";
+            txtTopText.TextChanged += TxtTopText_TextChanged;
 
-            Label lblFontTop = new Label { Text = "Yazı Tipi (Font):", Location = new Point(12, 68), AutoSize = true, Font = new Font("Segoe UI", 8f) };
-            cmbFontTop = new ComboBox { Location = new Point(12, 86), Size = new Size(310, 24), DropDownStyle = ComboBoxStyle.DropDownList, Font = new Font("Segoe UI", 8.5f) };
-            btnLoadCustomFont = new Button
-            {
-                Location = new Point(330, 85),
-                Size = new Size(116, 26),
-                Text = "➕ Font Yükle",
-                Font = new Font("Segoe UI", 8f, FontStyle.Bold),
-                BackColor = Color.FromArgb(241, 245, 249),
-                ForeColor = Color.FromArgb(15, 23, 42),
-                FlatStyle = FlatStyle.Flat,
-                Cursor = Cursors.Hand
-            };
+            UiLabel(grpTop, "Yazı tipi", UiCol(0), UiRow[1], UiSpan(2));
+            cmbFontTop = UiCombo(grpTop, UiCol(0), UiShellY(1), UiSpan(2), true);
+            numTextHeightTop = UiNumber(grpTop, "Harf boyu", "mm", 2, 1, 2.00m, 9.00m, 3.40m, 2, 0.05m);
+            numStretchTop = UiNumber(grpTop, "Dikey boy", "%", 3, 1, 70m, 180m, 100m, 0, 5m);
+            numCharGapTop = UiNumber(grpTop, "Harf aralığı", "mm", 0, 2, -1.00m, 2.50m, 0.00m, 2, 0.05m);
+            numWidthScaleTop = UiNumber(grpTop, "Kalınlık", "mm", 1, 2, 0.00m, 0.50m, 0.00m, 2, 0.02m);
+            UiLabel(grpTop, "Font ara", UiCol(2), UiRow[2], UiColW);
+            txtFontFilter = UiTextBox(grpTop, UiCol(2), UiShellY(2), UiColW);
+            uiTips.SetToolTip(txtFontFilter, "Yazı tipi listelerini filtreler.");
+            btnLoadCustomFont = UiButton(grpTop, "Font Ekle", "", ButtonKind.Secondary, UiCol(3), UiShellY(2), UiColW, UiShellH);
             btnLoadCustomFont.Click += BtnAddCustomFont_Click;
-            grpTop.Controls.Add(lblFontTop);
-            grpTop.Controls.Add(cmbFontTop);
-            grpTop.Controls.Add(btnLoadCustomFont);
+            uiTips.SetToolTip(btnLoadCustomFont, "Bilgisayardan .ttf / .otf yazı tipi ekler.");
 
-            Label lblHeightTop = new Label { Text = "Harf Boyu (mm):", Location = new Point(10, 116), AutoSize = true, Font = new Font("Segoe UI", 8f) };
-            numTextHeightTop = new NumericUpDown
-            {
-                Location = new Point(10, 134),
-                Size = new Size(98, 22),
-                DecimalPlaces = 2,
-                Increment = 0.05m,
-                Minimum = 2.00m,
-                Maximum = 9.00m,
-                Value = 3.40m,
-                Font = new Font("Segoe UI", 8.5f)
-            };
-            grpTop.Controls.Add(lblHeightTop);
-            grpTop.Controls.Add(numTextHeightTop);
+            // ==========================================
+            // SOL ALT: ALT YAZI
+            // ==========================================
+            grpBot = UiMakeCard("Alt Yazı", xL, yB);
 
-            Label lblStretchTop = new Label { Text = "Dikey Boy (%):", Location = new Point(118, 116), AutoSize = true, Font = new Font("Segoe UI", 8f) };
-            numStretchTop = new NumericUpDown
-            {
-                Location = new Point(118, 134),
-                Size = new Size(98, 22),
-                DecimalPlaces = 0,
-                Increment = 5m,
-                Minimum = 70m,
-                Maximum = 180m,
-                Value = 100m,
-                Font = new Font("Segoe UI", 8.5f)
-            };
-            grpTop.Controls.Add(lblStretchTop);
-            grpTop.Controls.Add(numStretchTop);
-
-            Label lblGapTop = new Label { Text = "Boşluk Gap (mm):", Location = new Point(226, 116), AutoSize = true, Font = new Font("Segoe UI", 8f) };
-            numCharGapTop = new NumericUpDown
-            {
-                Location = new Point(226, 134),
-                Size = new Size(102, 22),
-                DecimalPlaces = 2,
-                Increment = 0.05m,
-                Minimum = 0.00m,
-                Maximum = 2.50m,
-                Value = 0.00m,
-                Font = new Font("Segoe UI", 8.5f)
-            };
-            grpTop.Controls.Add(lblGapTop);
-            grpTop.Controls.Add(numCharGapTop);
-
-            Label lblWidthTop = new Label { Text = "Kalınlık (mm):", Location = new Point(338, 116), AutoSize = true, Font = new Font("Segoe UI", 8f) };
-            numWidthScaleTop = new NumericUpDown
-            {
-                Location = new Point(338, 134),
-                Size = new Size(108, 22),
-                DecimalPlaces = 2,
-                Increment = 0.02m,
-                Minimum = 0.00m,
-                Maximum = 0.50m,
-                Value = 0.00m,
-                Font = new Font("Segoe UI", 8.5f)
-            };
-            grpTop.Controls.Add(lblWidthTop);
-            grpTop.Controls.Add(numWidthScaleTop);
-
-            // [A] İSİMLİ & MARKA İÇİN: 2. ALT BÖLÜM
-            grpBot = new GroupBox();
-            grpBot.Text = " 2. Alt Bölüm (Telefon No) Ayarları ";
-            grpBot.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
-            grpBot.Location = new Point(10, 184);
-            grpBot.Size = new Size(460, 172);
-            pnlBody.Controls.Add(grpBot);
-
-            Label lblBot = new Label { Text = "Alt Yazı (Telefon / Seri No):", Location = new Point(12, 22), AutoSize = true, Font = new Font("Segoe UI", 8f) };
-            txtBotText = new TextBox { Location = new Point(12, 40), Size = new Size(300, 24), Font = new Font("Segoe UI", 10f, FontStyle.Bold), Text = "0506 938 19 49" };
+            txtBotText = UiTextBox(grpBot, UiPad, UiRow[0], inW, 52, 13f);
+            txtBotText.Text = "0506 938 19 49";
             txtBotText.TextChanged += TxtBotText_TextChanged;
-            grpBot.Controls.Add(lblBot);
-            grpBot.Controls.Add(txtBotText);
 
-            btnSyncFonts = new Button
-            {
-                Location = new Point(320, 39),
-                Size = new Size(126, 26),
-                Text = "Üst Fontu Al",
-                Font = new Font("Segoe UI", 8f, FontStyle.Bold),
-                FlatStyle = FlatStyle.Flat,
-                Cursor = Cursors.Hand
-            };
+            UiLabel(grpBot, "Yazı tipi", UiCol(0), UiRow[1], UiSpan(2));
+            cmbFontBot = UiCombo(grpBot, UiCol(0), UiShellY(1), UiSpan(2), true);
+            numTextHeightBot = UiNumber(grpBot, "Harf boyu", "mm", 2, 1, 2.00m, 9.00m, 3.40m, 2, 0.05m);
+            numStretchBot = UiNumber(grpBot, "Dikey boy", "%", 3, 1, 70m, 180m, 100m, 0, 5m);
+            numCharGapBot = UiNumber(grpBot, "Harf aralığı", "mm", 0, 2, -1.00m, 2.50m, 0.00m, 2, 0.05m);
+            numWidthScaleBot = UiNumber(grpBot, "Kalınlık", "mm", 1, 2, 0.00m, 0.50m, 0.00m, 2, 0.02m);
+            btnSyncFonts = UiButton(grpBot, "Üst fontu al", "", ButtonKind.Secondary, UiCol(2), UiShellY(2), UiColW, UiShellH);
             btnSyncFonts.Click += (s, e) =>
             {
                 if (cmbFontTop.SelectedItem != null)
@@ -5409,484 +6295,209 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                     UpdateFontPreview();
                 }
             };
-            grpBot.Controls.Add(btnSyncFonts);
-
-            Label lblFontBot = new Label { Text = "Yazı Tipi (Font):", Location = new Point(12, 68), AutoSize = true, Font = new Font("Segoe UI", 8f) };
-            cmbFontBot = new ComboBox { Location = new Point(12, 86), Size = new Size(310, 24), DropDownStyle = ComboBoxStyle.DropDownList, Font = new Font("Segoe UI", 8.5f) };
-            btnOpenFontsFolder = new Button
-            {
-                Location = new Point(330, 85),
-                Size = new Size(116, 26),
-                Text = "Font Klasörü",
-                Font = new Font("Segoe UI", 8f),
-                BackColor = Color.FromArgb(241, 245, 249),
-                ForeColor = Color.FromArgb(51, 65, 85),
-                FlatStyle = FlatStyle.Flat,
-                Cursor = Cursors.Hand
-            };
+            uiTips.SetToolTip(btnSyncFonts, "Alt yazıda da üst yazının yazı tipini kullanır.");
+            btnOpenFontsFolder = UiButton(grpBot, "Fontlar", "", ButtonKind.Secondary, UiCol(3), UiShellY(2), UiColW, UiShellH);
             btnOpenFontsFolder.Click += BtnOpenFontsFolder_Click;
-            grpBot.Controls.Add(lblFontBot);
-            grpBot.Controls.Add(cmbFontBot);
-            grpBot.Controls.Add(btnOpenFontsFolder);
+            uiTips.SetToolTip(btnOpenFontsFolder, "Font klasörünü açar.");
 
-            Label lblHeightBot = new Label { Text = "Harf Boyu (mm):", Location = new Point(10, 116), AutoSize = true, Font = new Font("Segoe UI", 8f) };
-            numTextHeightBot = new NumericUpDown
-            {
-                Location = new Point(10, 134),
-                Size = new Size(98, 22),
-                DecimalPlaces = 2,
-                Increment = 0.05m,
-                Minimum = 2.00m,
-                Maximum = 9.00m,
-                Value = 3.40m,
-                Font = new Font("Segoe UI", 8.5f)
-            };
-            grpBot.Controls.Add(lblHeightBot);
-            grpBot.Controls.Add(numTextHeightBot);
-
-            Label lblStretchBot = new Label { Text = "Dikey Boy (%):", Location = new Point(118, 116), AutoSize = true, Font = new Font("Segoe UI", 8f) };
-            numStretchBot = new NumericUpDown
-            {
-                Location = new Point(118, 134),
-                Size = new Size(98, 22),
-                DecimalPlaces = 0,
-                Increment = 5m,
-                Minimum = 70m,
-                Maximum = 180m,
-                Value = 100m,
-                Font = new Font("Segoe UI", 8.5f)
-            };
-            grpBot.Controls.Add(lblStretchBot);
-            grpBot.Controls.Add(numStretchBot);
-
-            Label lblGapBot = new Label { Text = "Boşluk Gap (mm):", Location = new Point(226, 116), AutoSize = true, Font = new Font("Segoe UI", 8f) };
-            numCharGapBot = new NumericUpDown
-            {
-                Location = new Point(226, 134),
-                Size = new Size(102, 22),
-                DecimalPlaces = 2,
-                Increment = 0.05m,
-                Minimum = 0.00m,
-                Maximum = 2.50m,
-                Value = 0.00m,
-                Font = new Font("Segoe UI", 8.5f)
-            };
-            grpBot.Controls.Add(lblGapBot);
-            grpBot.Controls.Add(numCharGapBot);
-
-            Label lblWidthBot = new Label { Text = "Kalınlık (mm):", Location = new Point(338, 116), AutoSize = true, Font = new Font("Segoe UI", 8f) };
-            numWidthScaleBot = new NumericUpDown
-            {
-                Location = new Point(338, 134),
-                Size = new Size(108, 22),
-                DecimalPlaces = 2,
-                Increment = 0.02m,
-                Minimum = 0.00m,
-                Maximum = 0.50m,
-                Value = 0.00m,
-                Font = new Font("Segoe UI", 8.5f)
-            };
-            grpBot.Controls.Add(lblWidthBot);
-            grpBot.Controls.Add(numWidthScaleBot);
-
-            // [B] SIRALI KLİPS İÇİN: NUMARALAR & PRESETLER KARTI
-            grpSeqNums = new GroupBox();
-            grpSeqNums.Text = " 1. Sıralı Numaralar & Hazır Paketler ";
-            grpSeqNums.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
-            grpSeqNums.Location = new Point(10, 6);
-            grpSeqNums.Size = new Size(460, 172);
+            // ==========================================
+            // SOL ÜST (Sıralı): NUMARALAR
+            // ==========================================
+            grpSeqNums = UiMakeCard("Numaralar", xL, yA);
             grpSeqNums.Visible = false;
-            pnlBody.Controls.Add(grpSeqNums);
 
-            btnPreset10 = new Button { Text = "01-10", Location = new Point(10, 24), Size = new Size(82, 28), Font = new Font("Segoe UI", 8.5f, FontStyle.Bold), FlatStyle = FlatStyle.Flat, Cursor = Cursors.Hand };
-            btnPreset20 = new Button { Text = "01-20", Location = new Point(98, 24), Size = new Size(82, 28), Font = new Font("Segoe UI", 8.5f, FontStyle.Bold), FlatStyle = FlatStyle.Flat, Cursor = Cursors.Hand };
-            btnPreset30 = new Button { Text = "01-30", Location = new Point(186, 24), Size = new Size(82, 28), Font = new Font("Segoe UI", 8.5f, FontStyle.Bold), FlatStyle = FlatStyle.Flat, Cursor = Cursors.Hand };
-            btnPreset40 = new Button { Text = "01-40", Location = new Point(274, 24), Size = new Size(82, 28), Font = new Font("Segoe UI", 8.5f, FontStyle.Bold), FlatStyle = FlatStyle.Flat, Cursor = Cursors.Hand };
-            btnPreset50 = new Button { Text = "01-50", Location = new Point(362, 24), Size = new Size(88, 28), Font = new Font("Segoe UI", 8.5f, FontStyle.Bold), FlatStyle = FlatStyle.Flat, Cursor = Cursors.Hand };
+            UiLabel(grpSeqNums, "Hazır set", UiCol(0), UiRow[0], inW);
+            int presetW = (inW - 4 * 8) / 5;
+            int[] presetEnds = { 10, 20, 30, 40, 50 };
+            ModernButton[] presets = new ModernButton[5];
+            for (int i = 0; i < 5; i++)
+            {
+                int end = presetEnds[i];
+                presets[i] = UiButton(grpSeqNums, "01-" + end.ToString("D2"), "", ButtonKind.Secondary, UiPad + i * (presetW + 8), UiShellY(0), presetW, UiShellH);
+                presets[i].Click += (s, e) => SetSeqRange(1, end);
+            }
+            btnPreset10 = presets[0]; btnPreset20 = presets[1]; btnPreset30 = presets[2]; btnPreset40 = presets[3]; btnPreset50 = presets[4];
 
-            btnPreset10.Click += (s, e) => SetSeqRange(1, 10);
-            btnPreset20.Click += (s, e) => SetSeqRange(1, 20);
-            btnPreset30.Click += (s, e) => SetSeqRange(1, 30);
-            btnPreset40.Click += (s, e) => SetSeqRange(1, 40);
-            btnPreset50.Click += (s, e) => SetSeqRange(1, 50);
-
-            grpSeqNums.Controls.Add(btnPreset10);
-            grpSeqNums.Controls.Add(btnPreset20);
-            grpSeqNums.Controls.Add(btnPreset30);
-            grpSeqNums.Controls.Add(btnPreset40);
-            grpSeqNums.Controls.Add(btnPreset50);
-
-            Label lblSeqStart = new Label { Text = "Başlangıç No:", Location = new Point(12, 60), AutoSize = true, Font = new Font("Segoe UI", 8f) };
-            numSeqStart = new NumericUpDown { Location = new Point(12, 78), Size = new Size(88, 23), Minimum = 1, Maximum = 999, Value = 1, Font = new Font("Segoe UI", 9f, FontStyle.Bold) };
+            numSeqStart = UiNumber(grpSeqNums, "Başlangıç", "", 0, 1, 1, 999, 1, 0, 1);
             numSeqStart.ValueChanged += (s, e) => UpdateSeqTotal();
-
-            Label lblSeqEnd = new Label { Text = "Bitiş No:", Location = new Point(110, 60), AutoSize = true, Font = new Font("Segoe UI", 8f) };
-            numSeqEnd = new NumericUpDown { Location = new Point(110, 78), Size = new Size(88, 23), Minimum = 1, Maximum = 999, Value = 10, Font = new Font("Segoe UI", 9f, FontStyle.Bold) };
+            numSeqEnd = UiNumber(grpSeqNums, "Bitiş", "", 1, 1, 1, 999, 10, 0, 1);
             numSeqEnd.ValueChanged += (s, e) => UpdateSeqTotal();
-
-            chkIncludeGender = new CheckBox
-            {
-                Text = "DiŞi & ERKEK Ekstra Ekle (+2 Klips)",
-                Location = new Point(216, 77),
-                AutoSize = true,
-                Checked = true,
-                Font = new Font("Segoe UI", 8.5f, FontStyle.Bold)
-            };
-            chkIncludeGender.CheckedChanged += (s, e) => UpdateSeqTotal();
-
-            lblSeqTotalCount = new Label
-            {
-                Location = new Point(12, 118),
-                Size = new Size(436, 40),
-                Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
-                ForeColor = Color.FromArgb(15, 118, 110),
-                Text = "Toplam: 12 Adet Sıralı Klips • Çift Tabla (Tabla 1: Siyah/Beyaz • Tabla 2: Çift Renk)"
-            };
-
-            grpSeqNums.Controls.Add(lblSeqStart);
-            grpSeqNums.Controls.Add(numSeqStart);
-            grpSeqNums.Controls.Add(lblSeqEnd);
-            grpSeqNums.Controls.Add(numSeqEnd);
-            grpSeqNums.Controls.Add(chkIncludeGender);
-            grpSeqNums.Controls.Add(lblSeqTotalCount);
-
-            // [B] SIRALI KLİPS İÇİN: FONT VE BOYUT KARTI
-            grpSeqFont = new GroupBox();
-            grpSeqFont.Text = " 2. Sıralı Yazı Tipi (Font) & Boyut Ayarları ";
-            grpSeqFont.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
-            grpSeqFont.Location = new Point(10, 184);
-            grpSeqFont.Size = new Size(460, 172);
-            grpSeqFont.Visible = false;
-            pnlBody.Controls.Add(grpSeqFont);
-
-            Label lblSeqFont = new Label { Text = "Yazı Tipi (Font):", Location = new Point(12, 22), AutoSize = true, Font = new Font("Segoe UI", 8f) };
-            cmbSeqFont = new ComboBox { Location = new Point(12, 40), Size = new Size(310, 24), DropDownStyle = ComboBoxStyle.DropDownList, Font = new Font("Segoe UI", 8.5f) };
-            cmbSeqFont.SelectedIndexChanged += (s, e) => UpdateFontPreview();
-
-            Label lblSeqFilter = new Label { Text = "Filtrele:", Location = new Point(330, 22), AutoSize = true, Font = new Font("Segoe UI", 8f) };
-            txtSeqFontFilter = new TextBox { Location = new Point(330, 40), Size = new Size(116, 23), Font = new Font("Segoe UI", 8.5f) };
-
-            btnSeqLoadCustomFont = new Button
-            {
-                Location = new Point(12, 72),
-                Size = new Size(140, 26),
-                Text = "➕ Özel Font Yükle",
-                Font = new Font("Segoe UI", 8f, FontStyle.Bold),
-                BackColor = Color.FromArgb(241, 245, 249),
-                FlatStyle = FlatStyle.Flat,
-                Cursor = Cursors.Hand
-            };
-            btnSeqLoadCustomFont.Click += BtnAddCustomFont_Click;
-
-            Label lblSeqH = new Label { Text = "Harf Boyu (mm):", Location = new Point(10, 116), AutoSize = true, Font = new Font("Segoe UI", 8f) };
-            numSeqHeight = new NumericUpDown
-            {
-                Location = new Point(10, 134),
-                Size = new Size(98, 22),
-                DecimalPlaces = 2,
-                Increment = 0.05m,
-                Minimum = 2.00m,
-                Maximum = 9.00m,
-                Value = 7.00m,
-                Font = new Font("Segoe UI", 8.5f)
-            };
-            numSeqHeight.ValueChanged += (s, e) => UpdateFontPreview();
-
-            Label lblSeqStr = new Label { Text = "Dikey Boy (%):", Location = new Point(118, 116), AutoSize = true, Font = new Font("Segoe UI", 8f) };
-            numSeqStretch = new NumericUpDown
-            {
-                Location = new Point(118, 134),
-                Size = new Size(98, 22),
-                DecimalPlaces = 0,
-                Increment = 5m,
-                Minimum = 70m,
-                Maximum = 180m,
-                Value = 100m,
-                Font = new Font("Segoe UI", 8.5f)
-            };
-            numSeqStretch.ValueChanged += (s, e) => UpdateFontPreview();
-
-            Label lblSeqG = new Label { Text = "Boşluk Gap (mm):", Location = new Point(226, 116), AutoSize = true, Font = new Font("Segoe UI", 8f) };
-            numSeqGap = new NumericUpDown
-            {
-                Location = new Point(226, 134),
-                Size = new Size(102, 22),
-                DecimalPlaces = 2,
-                Increment = 0.05m,
-                Minimum = 0.00m,
-                Maximum = 2.50m,
-                Value = 0.00m,
-                Font = new Font("Segoe UI", 8.5f)
-            };
-            numSeqGap.ValueChanged += (s, e) => UpdateFontPreview();
-
-            Label lblSeqW = new Label { Text = "Kalınlık (mm):", Location = new Point(338, 116), AutoSize = true, Font = new Font("Segoe UI", 8f) };
-            numSeqWidth = new NumericUpDown
-            {
-                Location = new Point(338, 134),
-                Size = new Size(108, 22),
-                DecimalPlaces = 2,
-                Increment = 0.02m,
-                Minimum = 0.00m,
-                Maximum = 0.50m,
-                Value = 0.00m,
-                Font = new Font("Segoe UI", 8.5f)
-            };
-            numSeqWidth.ValueChanged += (s, e) => UpdateFontPreview();
-
-            Label lblSeqLH = new Label { Text = "Katman (mm):", Location = new Point(226, 76), AutoSize = true, Font = new Font("Segoe UI", 8f) };
-            cmbSeqLayerHeight = new ComboBox
-            {
-                Location = new Point(338, 72),
-                Size = new Size(108, 24),
-                DropDownStyle = ComboBoxStyle.DropDownList,
-                Font = new Font("Segoe UI", 8.5f, FontStyle.Bold)
-            };
+            UiLabel(grpSeqNums, "Katman", UiCol(2), UiRow[1], UiColW);
+            cmbSeqLayerHeight = UiCombo(grpSeqNums, UiCol(2), UiShellY(1), UiColW);
             cmbSeqLayerHeight.Items.AddRange(new object[] { "0.12 mm", "0.16 mm", "0.20 mm" });
             cmbSeqLayerHeight.SelectedIndex = 0;
 
-            grpSeqFont.Controls.Add(lblSeqFont);
-            grpSeqFont.Controls.Add(cmbSeqFont);
-            grpSeqFont.Controls.Add(lblSeqFilter);
-            grpSeqFont.Controls.Add(txtSeqFontFilter);
-            grpSeqFont.Controls.Add(btnSeqLoadCustomFont);
-            grpSeqFont.Controls.Add(lblSeqLH);
-            grpSeqFont.Controls.Add(cmbSeqLayerHeight);
-            grpSeqFont.Controls.Add(lblSeqH);
-            grpSeqFont.Controls.Add(numSeqHeight);
-            grpSeqFont.Controls.Add(lblSeqStr);
-            grpSeqFont.Controls.Add(numSeqStretch);
-            grpSeqFont.Controls.Add(lblSeqG);
-            grpSeqFont.Controls.Add(numSeqGap);
-            grpSeqFont.Controls.Add(lblSeqW);
-            grpSeqFont.Controls.Add(numSeqWidth);
+            UiLabel(grpSeqNums, "Dişi + Erkek", UiCol(3), UiRow[1], UiColW);
+            ToggleSwitch tgGender = new ToggleSwitch { Text = "Ekle (+2)", Checked = true };
+            chkIncludeGender = tgGender;
+            grpSeqNums.Controls.Add(chkIncludeGender);
+            chkIncludeGender.Size = new Size(UiColW, UiShellH);
+            chkIncludeGender.Location = new Point(UiCol(3), UiShellY(1));
+            chkIncludeGender.CheckedChanged += (s, e) => UpdateSeqTotal();
+            uiTips.SetToolTip(chkIncludeGender, "Sete DİŞİ ve ERKEK yazılı 2 ekstra klips ekler.");
 
-            // [C] ORTAK 3. BASKI, RENK VE GEOMETRİ AYARLARI KARTI
-            grpParams = new GroupBox();
-            grpParams.Text = " 3. Baskı, Renk & Geometri Ayarları ";
-            grpParams.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
-            grpParams.Location = new Point(10, 362);
-            grpParams.Size = new Size(460, 230);
-            pnlBody.Controls.Add(grpParams);
+            lblSeqTotalCount = new PillLabel { Location = new Point(UiPad, UiShellY(2) - 8), Size = new Size(inW, 40), Font = UiF(9.5f, true) };
+            grpSeqNums.Controls.Add(lblSeqTotalCount);
 
-            Label lblMat = new Label { Text = "Malzeme:", Location = new Point(12, 22), AutoSize = true, Font = new Font("Segoe UI", 8f) };
-            cmbMaterial = new ComboBox { Location = new Point(12, 38), Size = new Size(100, 23), DropDownStyle = ComboBoxStyle.DropDownList, Font = new Font("Segoe UI", 8.5f, FontStyle.Bold) };
-            cmbMaterial.Items.Add("PLA");
-            cmbMaterial.Items.Add("PETG");
-            cmbMaterial.SelectedIndex = 0;
-            grpParams.Controls.Add(lblMat);
-            grpParams.Controls.Add(cmbMaterial);
+            // ==========================================
+            // SOL ALT (Sıralı): YAZI TİPİ
+            // ==========================================
+            grpSeqFont = UiMakeCard("Yazı Tipi", xL, yB);
+            grpSeqFont.Visible = false;
 
-            Label lblEmboss = new Label { Text = "Dış Kabartma (Emboss):", Location = new Point(125, 22), AutoSize = true, Font = new Font("Segoe UI", 8f) };
-            numEmboss = new NumericUpDown { Location = new Point(125, 38), Size = new Size(150, 22), DecimalPlaces = 2, Increment = 0.05m, Minimum = 0.00m, Maximum = 1.00m, Value = 0.15m, Font = new Font("Segoe UI", 8.5f) };
-            grpParams.Controls.Add(lblEmboss);
-            grpParams.Controls.Add(numEmboss);
+            UiLabel(grpSeqFont, "Yazı tipi", UiCol(0), UiRow[0], UiSpan(2));
+            cmbSeqFont = UiCombo(grpSeqFont, UiCol(0), UiShellY(0), UiSpan(2), true);
+            cmbSeqFont.SelectedIndexChanged += (s, e) => UpdateFontPreview();
+            UiLabel(grpSeqFont, "Font ara", UiCol(2), UiRow[0], UiColW);
+            txtSeqFontFilter = UiTextBox(grpSeqFont, UiCol(2), UiShellY(0), UiColW);
+            btnSeqLoadCustomFont = UiButton(grpSeqFont, "Font Ekle", "", ButtonKind.Secondary, UiCol(3), UiShellY(0), UiColW, UiShellH);
+            btnSeqLoadCustomFont.Click += BtnAddCustomFont_Click;
 
-            Label lblEmbed = new Label { Text = "İç Gömülme (Embed):", Location = new Point(290, 22), AutoSize = true, Font = new Font("Segoe UI", 8f) };
-            numEmbed = new NumericUpDown { Location = new Point(290, 38), Size = new Size(156, 22), DecimalPlaces = 2, Increment = 0.05m, Minimum = 0.30m, Maximum = 1.00m, Value = 0.50m, Font = new Font("Segoe UI", 8.5f) };
-            grpParams.Controls.Add(lblEmbed);
-            grpParams.Controls.Add(numEmbed);
+            numSeqHeight = UiNumber(grpSeqFont, "Harf boyu", "mm", 0, 1, 2.00m, 9.00m, 7.00m, 2, 0.05m);
+            numSeqStretch = UiNumber(grpSeqFont, "Dikey boy", "%", 1, 1, 70m, 180m, 100m, 0, 5m);
+            numSeqGap = UiNumber(grpSeqFont, "Harf aralığı", "mm", 2, 1, -1.00m, 2.50m, 0.00m, 2, 0.05m);
+            numSeqWidth = UiNumber(grpSeqFont, "Kalınlık", "mm", 3, 1, 0.00m, 0.50m, 0.00m, 2, 0.02m);
+            numSeqHeight.ValueChanged += (s, e) => UpdateFontPreview();
+            numSeqStretch.ValueChanged += (s, e) => UpdateFontPreview();
+            numSeqGap.ValueChanged += (s, e) => UpdateFontPreview();
+            numSeqWidth.ValueChanged += (s, e) => UpdateFontPreview();
 
-            Label lblColorTitle = new Label { Text = "Baskı Renkleri (Gövde & Kabartma Yazı):", Location = new Point(12, 70), AutoSize = true, Font = new Font("Segoe UI", 8f) };
-            cmbColorPresets = new ComboBox { Location = new Point(12, 88), Size = new Size(240, 23), DropDownStyle = ComboBoxStyle.DropDownList, Font = new Font("Segoe UI", 8.5f) };
-            cmbColorPresets.Items.Add("Sarı / Kırmızı (Varsayılan)");
-            cmbColorPresets.Items.Add("Beyaz / Siyah");
-            cmbColorPresets.Items.Add("Siyah / Beyaz");
-            cmbColorPresets.Items.Add("Mavi / Beyaz");
-            cmbColorPresets.Items.Add("Turuncu / Siyah");
-            cmbColorPresets.Items.Add("Yeşil / Beyaz");
-            cmbColorPresets.Items.Add("Kırmızı / Beyaz");
-            cmbColorPresets.Items.Add("Yeşil / Kırmızı / Beyaz");
-            cmbColorPresets.Items.Add("Altın Sarı / Siyah");
-            cmbColorPresets.Items.Add("Özel Renk Seç...");
-            cmbColorPresets.SelectedIndex = 0;
-            cmbColorPresets.SelectedIndexChanged += CmbColorPresets_SelectedIndexChanged;
-            grpParams.Controls.Add(lblColorTitle);
-            grpParams.Controls.Add(cmbColorPresets);
+            Label lblSeqHint = UiLabel(grpSeqFont, "Numara, 9 mm klipsin tam ortasına tek satır olarak yazılır.", UiPad, UiShellY(2) + 6, inW);
 
-            btnColor1 = new Button { Location = new Point(255, 87), Size = new Size(32, 25), BackColor = currentColor1, FlatStyle = FlatStyle.Flat, Cursor = Cursors.Hand };
-            btnColor1.Click += BtnColor1_Click;
-            grpParams.Controls.Add(btnColor1);
-
-            btnColor2 = new Button { Location = new Point(291, 87), Size = new Size(32, 25), BackColor = currentColor2, FlatStyle = FlatStyle.Flat, Cursor = Cursors.Hand };
-            btnColor2.Click += BtnColor2_Click;
-            grpParams.Controls.Add(btnColor2);
-
-            btnColor3 = new Button { Location = new Point(327, 87), Size = new Size(32, 25), BackColor = currentColor3, FlatStyle = FlatStyle.Flat, Cursor = Cursors.Hand };
-            btnColor3.Click += BtnColor3_Click;
-            grpParams.Controls.Add(btnColor3);
-
-            btnSwapColors = new Button { Location = new Point(363, 87), Size = new Size(32, 25), Text = "⇄", Font = new Font("Segoe UI", 9f, FontStyle.Bold), FlatStyle = FlatStyle.Flat, Cursor = Cursors.Hand };
-            btnSwapColors.Click += BtnSwapColors_Click;
-            grpParams.Controls.Add(btnSwapColors);
-
-            lblColorHint = new Label
-            {
-                Text = "R1 (Alt Gövde) • R2 (Üst Gövde) • R3 (Yazı Rengi - Tıklayıp Değiştirin)",
-                Location = new Point(12, 116),
-                AutoSize = true,
-                Font = new Font("Segoe UI", 7.5f, FontStyle.Bold),
-                ForeColor = Color.FromArgb(71, 85, 105)
-            };
-            grpParams.Controls.Add(lblColorHint);
-
-            Label lblBak = new Label { Text = "Referans Şablon Dosyası (.3mf.bak):", Location = new Point(12, 140), AutoSize = true, Font = new Font("Segoe UI", 8f) };
-            txtBakPath = new TextBox { Location = new Point(12, 158), Size = new Size(365, 23), Font = new Font("Segoe UI", 8f), Text = GetDefaultBakPath("BOS_KLIPS_9MM.3mf.bak") };
-            btnBrowseBak = new Button { Location = new Point(383, 157), Size = new Size(63, 25), Text = "Gözat...", Font = new Font("Segoe UI", 8f) };
-            btnBrowseBak.Click += BtnBrowseBak_Click;
-            grpParams.Controls.Add(lblBak);
-            grpParams.Controls.Add(txtBakPath);
-            grpParams.Controls.Add(btnBrowseBak);
-
-            Label lblTemplateHint = new Label
-            {
-                Text = "Not: Z=0.00 mm tabla kotu şablondaki matristen tam hizalanır.",
-                Location = new Point(12, 190),
-                AutoSize = true,
-                Font = new Font("Segoe UI", 7.5f),
-                ForeColor = Color.FromArgb(71, 85, 105)
-            };
-            grpParams.Controls.Add(lblTemplateHint);
-
-            // ------------------------------------------
-            // SAĞ KOLON: ÖNİZLEME, BUTONLAR & LOG (Width: 456)
-            // ------------------------------------------
-
-            // 4. CANLI ÖNİZLEME KARTI
-            grpPreview = new GroupBox();
-            grpPreview.Text = " 4. Canlı Önizleme (4.50 mm Halka Bant Ölçekli) ";
-            grpPreview.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
-            grpPreview.Location = new Point(478, 6);
-            grpPreview.Size = new Size(456, 172);
-            pnlBody.Controls.Add(grpPreview);
+            // ==========================================
+            // SAĞ ÜST: ÖNİZLEME
+            // ==========================================
+            grpPreview = UiMakeCard("Önizleme", xR, yA);
 
             lblScaleInfo = new Label
             {
-                Text = "Ölçü: Üst: 3.40mm (%76) | Alt: 3.40mm (%76) • 4.50mm Bant",
-                Location = new Point(10, 20),
-                Size = new Size(436, 16),
-                Font = new Font("Segoe UI", 8f, FontStyle.Bold),
-                ForeColor = Color.FromArgb(15, 118, 110),
-                TextAlign = ContentAlignment.TopRight
+                Location = new Point(130, 20),
+                Size = new Size(UiCardW - UiPad - 130, 18),
+                Font = UiF(8.5f),
+                ForeColor = UiMuted,
+                TextAlign = ContentAlignment.TopRight,
+                UseMnemonic = false,
+                AutoEllipsis = true
             };
             grpPreview.Controls.Add(lblScaleInfo);
 
-            pnlFontPreview = new DoubleBufferedPanel();
-            pnlFontPreview.Location = new Point(10, 38);
-            pnlFontPreview.Size = new Size(436, 122);
-            pnlFontPreview.BackColor = Color.FromArgb(15, 23, 42);
+            pnlFontPreview = new DoubleBufferedPanel
+            {
+                Location = new Point(UiPad, UiRow[0]),
+                Size = new Size(inW, UiCardH - UiRow[0] - UiPad + 2),
+                BackColor = UiCard
+            };
             pnlFontPreview.Paint += PnlFontPreview_Paint;
             grpPreview.Controls.Add(pnlFontPreview);
 
-            // 5. İŞLEM BUTONLARI KARTI
-            GroupBox grpActions = new GroupBox();
-            grpActions.Text = " 5. Üretim, Hız Profili ve Dosya İşlemleri ";
-            grpActions.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
-            grpActions.Location = new Point(478, 184);
-            grpActions.Size = new Size(456, 178);
-            pnlBody.Controls.Add(grpActions);
+            // ==========================================
+            // SAĞ ALT: BASKI AYARLARI (tüm modlar)
+            // ==========================================
+            grpParams = UiMakeCard("Baskı Ayarları", xR, yB);
 
-            Label lblSpeedTitle = new Label { Text = "Baskı Hızı:", Location = new Point(10, 18), AutoSize = true, Font = new Font("Segoe UI", 8.5f, FontStyle.Bold) };
-            grpActions.Controls.Add(lblSpeedTitle);
+            UiLabel(grpParams, "Malzeme", UiCol(0), UiRow[0], UiColW);
+            cmbMaterial = UiCombo(grpParams, UiCol(0), UiShellY(0), UiColW);
+            cmbMaterial.Items.Add("PLA");
+            cmbMaterial.Items.Add("PETG");
+            cmbMaterial.SelectedIndex = 0;
 
-            rbSpeedFast = new RadioButton { Text = "🚀 Hızlı Baskı", Location = new Point(95, 17), Size = new Size(130, 20), Checked = true, Font = new Font("Segoe UI", 8.5f, FontStyle.Bold), ForeColor = Color.FromArgb(2, 132, 199), Cursor = Cursors.Hand };
-            rbSpeedSlow = new RadioButton { Text = "🛡️ Yavaş Baskı", Location = new Point(235, 17), Size = new Size(130, 20), Font = new Font("Segoe UI", 8.5f), ForeColor = Color.FromArgb(71, 85, 105), Cursor = Cursors.Hand };
-            grpActions.Controls.Add(rbSpeedFast);
-            grpActions.Controls.Add(rbSpeedSlow);
+            numEmboss = UiNumber(grpParams, "Kabartma", "mm", 1, 0, 0.00m, 1.00m, 0.20m, 2, 0.05m);
+            uiTips.SetToolTip(numEmboss.Parent, "Yazının gövde yüzeyinden dışarı taşma yüksekliği.");
+            numEmbed = UiNumber(grpParams, "Gömülme", "mm", 2, 0, 0.30m, 1.00m, 0.60m, 2, 0.05m);
+            uiTips.SetToolTip(numEmbed.Parent, "Yazının gövdenin içine gömülen kök derinliği (kopmayı önler).");
+            numChamfer = UiNumber(grpParams, "Sarkma pahı", "°", 3, 0, 0m, 60m, 0m, 0, 5m);
+            uiTips.SetToolTip(numChamfer.Parent, "Harflerin alt kenarı gövdeden bu açıyla (dikeyden) eğimli çıkar, böylece kabartma sarkmaz.\n0 = kapalı (varsayılan, 0.20 mm kabartma için gerekmez).\n45° = kabartma 0.30 mm ve üstündeyse önerilir; küçük harflerde iç boşlukları biraz daraltır.");
 
-            btnGenerate = new Button
+            UiLabel(grpParams, "Renk şablonu", UiCol(0), UiRow[1], UiSpan(2));
+            cmbColorPresets = UiCombo(grpParams, UiCol(0), UiShellY(1), UiSpan(2));
+            cmbColorPresets.Items.AddRange(new object[] {
+                "Sarı / Kırmızı (Varsayılan)", "Beyaz / Siyah", "Siyah / Beyaz", "Mavi / Beyaz", "Turuncu / Siyah",
+                "Yeşil / Beyaz", "Kırmızı / Beyaz", "Yeşil / Kırmızı / Beyaz", "Altın Sarı / Siyah", "Özel Renk Seç..." });
+            cmbColorPresets.SelectedIndex = 0;
+            cmbColorPresets.SelectedIndexChanged += CmbColorPresets_SelectedIndexChanged;
+
+            UiLabel(grpParams, "Renkler", UiCol(2), UiRow[1], UiSpan(2));
+            int sx = UiCol(2);
+            btnColor1 = UiSwatch(grpParams, sx, UiShellY(1), currentColor1, "R1", BtnColor1_Click, "R1: alt gövde rengi (tıklayıp değiştirin)");
+            btnColor2 = UiSwatch(grpParams, sx + 40, UiShellY(1), currentColor2, "R2", BtnColor2_Click, "R2: üst gövde ve yazı rengi (tıklayıp değiştirin)");
+            btnColor3 = UiSwatch(grpParams, sx + 80, UiShellY(1), currentColor3, "R3", BtnColor3_Click, "R3: numara rengi (tıklayıp değiştirin)");
+            btnSwapColors = UiButton(grpParams, "Değiştir", "", ButtonKind.Secondary, UiCol(3), UiShellY(1), UiColW, UiShellH);
+            btnSwapColors.Click += BtnSwapColors_Click;
+            uiTips.SetToolTip(btnSwapColors, "R1 ve R2 renklerini yer değiştirir.");
+
+            UiLabel(grpParams, "Şablon dosyası (.3mf.bak)", UiCol(0), UiRow[2], UiSpan(3));
+            txtBakPath = UiTextBox(grpParams, UiCol(0), UiShellY(2), UiSpan(3), UiShellH, 8.75f);
+            txtBakPath.Text = GetDefaultBakPath("BOS_KLIPS_9MM.3mf.bak");
+            btnBrowseBak = UiButton(grpParams, "Gözat", "", ButtonKind.Secondary, UiCol(3), UiShellY(2), UiColW, UiShellH);
+            btnBrowseBak.Click += BtnBrowseBak_Click;
+
+            // ==========================================
+            // İŞLEM GÜNLÜĞÜ: sağda açılan panel, pencere genişler ve içerik yerinde kalır
+            // ==========================================
+            baseClientW = clientW;
+            int drawerH = clientH - headerH - footerH;
+            logDrawer = new DrawerPanel { Bounds = new Rectangle(clientW, headerH, LogDrawerW, drawerH), Visible = false };
+            this.Controls.Add(logDrawer);
+
+            Label lblLogTitle = new Label
             {
-                Text = "▶  3MF DOSYASINI OLUŞTUR",
-                Font = new Font("Segoe UI", 10.5f, FontStyle.Bold),
-                BackColor = Color.FromArgb(2, 132, 199),
-                ForeColor = Color.White,
-                FlatStyle = FlatStyle.Flat,
-                Location = new Point(10, 42),
-                Size = new Size(436, 36),
-                Cursor = Cursors.Hand
+                Text = "İşlem Günlüğü",
+                Location = new Point(UiMargin, 22),
+                AutoSize = true,
+                Font = UiF(11f, true),
+                ForeColor = UiText,
+                BackColor = UiCard,
+                UseMnemonic = false
             };
-            btnGenerate.FlatAppearance.BorderSize = 0;
-            btnGenerate.Click += BtnGenerate_Click;
-            grpActions.Controls.Add(btnGenerate);
+            logDrawer.Controls.Add(lblLogTitle);
 
-            btnOpenOrca = new Button
+            int lbx = LogDrawerW - UiMargin - 32;
+            ModernButton btnLogClose = UiButton(logDrawer, "", "\uE711", ButtonKind.Ghost, lbx, 16, 32, 32);
+            btnLogClose.Click += (s, e) => SetLogDrawer(false);
+            uiTips.SetToolTip(btnLogClose, "Kapat (Esc)");
+            ModernButton btnLogClear = UiButton(logDrawer, "", "\uE74D", ButtonKind.Ghost, lbx - 36, 16, 32, 32);
+            btnLogClear.Click += (s, e) => txtLog.Clear();
+            uiTips.SetToolTip(btnLogClear, "Temizle");
+            ModernButton btnLogCopy = UiButton(logDrawer, "", "\uE8C8", ButtonKind.Ghost, lbx - 72, 16, 32, 32);
+            btnLogCopy.Click += (s, e) => { if (txtLog.TextLength > 0) Clipboard.SetText(txtLog.Text); };
+            uiTips.SetToolTip(btnLogCopy, "Tümünü kopyala");
+
+            Panel logHost = new Panel
             {
-                Text = "OrcaSlicer'da Aç",
-                Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
-                BackColor = Color.FromArgb(241, 245, 249),
-                ForeColor = Color.FromArgb(51, 65, 85),
-                FlatStyle = FlatStyle.Flat,
-                Location = new Point(10, 84),
-                Size = new Size(213, 30),
-                Cursor = Cursors.Hand
+                Location = new Point(UiMargin, 62),
+                Size = new Size(LogDrawerW - 2 * UiMargin, drawerH - 62 - UiMargin),
+                Padding = new Padding(12, 10, 4, 10),
+                BackColor = Color.FromArgb(248, 250, 252)
             };
-            btnOpenOrca.Click += BtnOpenOrca_Click;
-            grpActions.Controls.Add(btnOpenOrca);
-
-            btnOpenFolder = new Button
+            logHost.Paint += (s, e) =>
             {
-                Text = "Klasörü Aç",
-                Font = new Font("Segoe UI", 8.5f),
-                BackColor = Color.FromArgb(241, 245, 249),
-                ForeColor = Color.FromArgb(51, 65, 85),
-                FlatStyle = FlatStyle.Flat,
-                Location = new Point(233, 84),
-                Size = new Size(213, 30),
-                Cursor = Cursors.Hand
+                using (Pen pn = new Pen(UiBorder)) e.Graphics.DrawRectangle(pn, 0, 0, logHost.Width - 1, logHost.Height - 1);
             };
-            btnOpenFolder.Click += BtnOpenFolder_Click;
-            grpActions.Controls.Add(btnOpenFolder);
-
-            btnLoad3mf = new Button
-            {
-                Text = "Ayarları .3MF'den Yükle...",
-                Font = new Font("Segoe UI", 8f, FontStyle.Bold),
-                BackColor = Color.FromArgb(241, 245, 249),
-                ForeColor = Color.FromArgb(30, 41, 59),
-                FlatStyle = FlatStyle.Flat,
-                Location = new Point(10, 120),
-                Size = new Size(213, 30),
-                Cursor = Cursors.Hand
-            };
-            btnLoad3mf.Click += BtnLoad3mf_Click;
-            grpActions.Controls.Add(btnLoad3mf);
-
-            btnViewInfo = new Button
-            {
-                Text = "Bilgi Raporunu Aç (_bilgi.txt)",
-                Font = new Font("Segoe UI", 8f),
-                BackColor = Color.FromArgb(241, 245, 249),
-                ForeColor = Color.FromArgb(51, 65, 85),
-                FlatStyle = FlatStyle.Flat,
-                Location = new Point(233, 120),
-                Size = new Size(213, 30),
-                Cursor = Cursors.Hand
-            };
-            btnViewInfo.Click += BtnViewInfo_Click;
-            grpActions.Controls.Add(btnViewInfo);
-
-            // 6. İŞLEM GÜNLÜĞÜ (LOG CONSOLE)
-            GroupBox grpLog = new GroupBox();
-            grpLog.Text = " 6. İşlem Günlüğü ";
-            grpLog.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
-            grpLog.Location = new Point(478, 368);
-            grpLog.Size = new Size(456, 224);
-            pnlBody.Controls.Add(grpLog);
-
+            logDrawer.Controls.Add(logHost);
             txtLog = new TextBox
             {
                 Multiline = true,
                 ReadOnly = true,
+                WordWrap = true,
                 ScrollBars = ScrollBars.Vertical,
-                Font = new Font("Consolas", 8f),
-                BackColor = Color.FromArgb(15, 23, 42),
-                ForeColor = Color.FromArgb(226, 232, 240),
-                Location = new Point(10, 20),
-                Size = new Size(436, 228)
+                Font = new Font("Consolas", 8.5f),
+                BackColor = Color.FromArgb(248, 250, 252),
+                ForeColor = UiTextSoft,
+                BorderStyle = BorderStyle.None,
+                Dock = DockStyle.Fill
             };
-            grpLog.Controls.Add(txtLog);
+            logHost.Controls.Add(txtLog);
+            IntPtr forceLogHandle = txtLog.Handle;   // gizliyken de arka plan iş parçacığından güvenle yazılabilsin
 
-            // Event wiring for instant preview
+            logDrawerTimer = new Timer { Interval = 12 };
+            logDrawerTimer.Tick += LogDrawerTimer_Tick;
+            this.KeyPreview = true;
+            this.KeyDown += (s, e) =>
+            {
+                if (e.KeyCode == Keys.Escape && logDrawerOpen) { SetLogDrawer(false); e.Handled = true; }
+            };
+
+            // Anlık önizleme bağlantıları
             cmbFontTop.SelectedIndexChanged += (s, e) => UpdateFontPreview();
             cmbFontBot.SelectedIndexChanged += (s, e) => UpdateFontPreview();
             numTextHeightTop.ValueChanged += (s, e) => UpdateFontPreview();
@@ -5898,18 +6509,42 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
             numWidthScaleTop.ValueChanged += (s, e) => UpdateFontPreview();
             numWidthScaleBot.ValueChanged += (s, e) => UpdateFontPreview();
 
-            // Font listesini baslat
+            // Font listesini başlat
             InitFontLists(cmbFontTop, cmbFontBot, cmbSeqFont, txtFontFilter, txtSeqFontFilter, "Trebuchet MS", "Trebuchet MS");
-            
+
             // Son oturumdaki ayarları otomatik yükle
             LoadLastSettings();
+            ResetPerJobSettings();
             SetMode(currentMode);
+            UpdateSeqTotal();
             UpdateFontPreview();
 
             this.FormClosing += (s, e) => SaveLastSettings();
 
-            AppendLog("Program hazır. Üst kısımdan klips tipini seçiniz: İSİMLİ KLİPS, SIRALI KLİPS veya MARKA TİPİ.");
+            AppendLog("Program hazır. Üst bardan klips tipini seçin: İsimli Klips, Sıralı Klips veya Marka Tipi.");
             AppendLog("Baskı ayarları: Brim = outer 2mm / 0.14 gap, İlk Katman = 18 mm/s, Prime Tower = kompakt 22mm, Tam 2 Filament.");
+        }
+
+        /// <summary>
+        /// Her açılışta sabit başlayan ayarlar (son oturumdan hatırlanmaz):
+        /// harf aralığı 0, kalınlık 0, dikey boy %100, kabartma 0.20, gömülme 0.60, pah 0.
+        /// "Ayar Yükle" ile bir .3mf'den yüklenen ayarlar ise olduğu gibi uygulanır.
+        /// </summary>
+        private void ResetPerJobSettings()
+        {
+            numCharGapTop.Value = 0m; numCharGapBot.Value = 0m; numSeqGap.Value = 0m;
+            numWidthScaleTop.Value = 0m; numWidthScaleBot.Value = 0m; numSeqWidth.Value = 0m;
+            numStretchTop.Value = 100m; numStretchBot.Value = 100m; numSeqStretch.Value = 100m;
+            numEmboss.Value = 0.20m;
+            numEmbed.Value = 0.60m;
+            numChamfer.Value = 0m;
+        }
+
+        private string GenerateButtonText()
+        {
+            if (currentMode == GeneratorMode.SiraliKlips) return "Sıralı Klips Oluştur";
+            if (currentMode == GeneratorMode.MarkaTipi) return "Marka Tipi Oluştur";
+            return "3MF Oluştur";
         }
 
         private void SetSeqRange(int start, int end)
@@ -5925,7 +6560,7 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
             int e = (int)numSeqEnd.Value;
             if (e < s) e = s;
             int count = (e - s + 1) + (chkIncludeGender.Checked ? 2 : 0);
-            lblSeqTotalCount.Text = string.Format("Toplam: {0} Adet Sıralı Klips • Çift Tabla (Tabla 1: Siyah/Beyaz • Tabla 2: Çift Renk)", count);
+            lblSeqTotalCount.Text = string.Format("Toplam {0} klips  ·  2 tabla (düz renk ve çift renk)", count);
             UpdateFontPreview();
         }
 
@@ -5933,67 +6568,38 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
         {
             currentMode = newMode;
 
-            // Update button styles
-            Color activeBg = Color.FromArgb(2, 132, 199);
-            Color activeFg = Color.White;
-            Color inactiveBg = Color.FromArgb(241, 245, 249);
-            Color inactiveFg = Color.FromArgb(51, 65, 85);
+            // Üst bardaki mod seçici (segment kontrol)
+            ((ModernButton)btnModeIsimli).Active = newMode == GeneratorMode.IsimliKlips;
+            ((ModernButton)btnModeSirali).Active = newMode == GeneratorMode.SiraliKlips;
+            ((ModernButton)btnModeMarka).Active = newMode == GeneratorMode.MarkaTipi;
 
-            btnModeIsimli.BackColor = (newMode == GeneratorMode.IsimliKlips) ? activeBg : inactiveBg;
-            btnModeIsimli.ForeColor = (newMode == GeneratorMode.IsimliKlips) ? activeFg : inactiveFg;
+            bool isSeq = newMode == GeneratorMode.SiraliKlips;
+            grpTop.Visible = !isSeq;
+            grpBot.Visible = !isSeq;
+            grpSeqNums.Visible = isSeq;
+            grpSeqFont.Visible = isSeq;
+            if (btnColor3 != null) btnColor3.Visible = isSeq;
 
-            btnModeSirali.BackColor = (newMode == GeneratorMode.SiraliKlips) ? activeBg : inactiveBg;
-            btnModeSirali.ForeColor = (newMode == GeneratorMode.SiraliKlips) ? activeFg : inactiveFg;
-
-            btnModeMarka.BackColor = (newMode == GeneratorMode.MarkaTipi) ? activeBg : inactiveBg;
-            btnModeMarka.ForeColor = (newMode == GeneratorMode.MarkaTipi) ? activeFg : inactiveFg;
-
-            if (newMode == GeneratorMode.SiraliKlips)
+            if (isSeq)
             {
-                grpTop.Visible = false;
-                grpBot.Visible = false;
-                grpSeqNums.Visible = true;
-                grpSeqFont.Visible = true;
-                if (btnColor3 != null) btnColor3.Visible = true;
-                if (btnSwapColors != null) btnSwapColors.Location = new Point(363, 87);
-                if (lblColorHint != null) lblColorHint.Text = "R1 (Alt Gövde) • R2 (Üst Gövde) • R3 (Yazı Rengi - Tıklayıp Değiştirin)";
-                grpParams.Text = " 3. Baskı, Renk & Geometri (Sıralı Klips) ";
-                lblModeDesc.Text = "Çift tablalı sıralı klips (01-10..50 + Dişi/Erkek • Tabla 1: Siyah/Beyaz, Tabla 2: Çift Renk)";
-                btnGenerate.Text = "▶  SIRALI KLİPS 3MF (ÇİFT TABLA) OLUŞTUR";
+                lblModeDesc.Text = "Numaralı klips seti (01-50), isteğe bağlı Dişi / Erkek • 2 tabla: düz renk ve çift renk";
                 txtBakPath.Text = GetDefaultBakPath("BOS_KLIPS_9MM.3mf.bak");
             }
             else if (newMode == GeneratorMode.MarkaTipi)
             {
-                grpTop.Visible = true;
-                grpBot.Visible = true;
-                grpSeqNums.Visible = false;
-                grpSeqFont.Visible = false;
-                if (btnColor3 != null) btnColor3.Visible = false;
-                if (btnSwapColors != null) btnSwapColors.Location = new Point(327, 87);
-                if (lblColorHint != null) lblColorHint.Text = "R1 (Alt Gövde) • R2 (Üst Gövde / Kabartma Yazı - Tıklayıp Değiştirin)";
-                grpTop.Text = " 1. Üst Bölüm (Marka / İsim) Ayarları ";
-                grpBot.Text = " 2. Alt Bölüm (Seri No / Telefon) Ayarları ";
-                grpParams.Text = " 3. Baskı, Renk & Geometri (Dairesel Halka) ";
-                lblModeDesc.Text = "360° kesintisiz yuvarlak dairesel halka (Dış çap: ~11.25 mm, İç çap: ~8.60 mm)";
-                btnGenerate.Text = "▶  MARKA TİPİ 3MF OLUŞTUR";
+                grpTop.Text = "Üst Yazı  ·  Marka";
+                grpBot.Text = "Alt Yazı  ·  Seri No";
+                lblModeDesc.Text = "360° kesintisiz yuvarlak halka • dış çap ~11.25 mm, iç çap ~8.60 mm";
                 txtBakPath.Text = GetDefaultBakPath("MARKA_TIPI.3mf.bak");
             }
-            else // IsimliKlips
+            else
             {
-                grpTop.Visible = true;
-                grpBot.Visible = true;
-                grpSeqNums.Visible = false;
-                grpSeqFont.Visible = false;
-                if (btnColor3 != null) btnColor3.Visible = false;
-                if (btnSwapColors != null) btnSwapColors.Location = new Point(327, 87);
-                if (lblColorHint != null) lblColorHint.Text = "R1 (Alt Gövde) • R2 (Üst Gövde / Kabartma Yazı - Tıklayıp Değiştirin)";
-                grpTop.Text = " 1. Üst Bölüm (İsim Soyisim) Ayarları ";
-                grpBot.Text = " 2. Alt Bölüm (Telefon No) Ayarları ";
-                grpParams.Text = " 3. Baskı, Renk & Geometri Ayarları ";
-                lblModeDesc.Text = "Kişiye özel tekli çift renkli klipsli halka (258° simetrik kilit korumalı yay)";
-                btnGenerate.Text = "▶  3MF DOSYASINI OLUŞTUR";
+                grpTop.Text = "Üst Yazı  ·  İsim";
+                grpBot.Text = "Alt Yazı  ·  Telefon";
+                lblModeDesc.Text = "Kişiye özel, çift renkli klipsli halka • 9 mm gövde, 258° yazı yayı";
                 txtBakPath.Text = GetDefaultBakPath("BOS_KLIPS_9MM.3mf.bak");
             }
+            btnGenerate.Text = GenerateButtonText();
 
             UpdateFontPreview();
         }
@@ -6219,11 +6825,14 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
         {
             Graphics g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
 
             int w = pnlFontPreview.ClientSize.Width;
             int h = pnlFontPreview.ClientSize.Height;
-            int gap = 4;
+            int gap = 6;
+            g.Clear(UiCard);
+            GraphicsPath previewClip = UiRound(new RectangleF(0, 0, w, h), 10f);
+            g.SetClip(previewClip);
             int halfH = (h - gap) / 2;
 
             const double bandHeightMm = 4.50;
@@ -6249,9 +6858,9 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                 {
                     g.FillRectangle(bg, t1Rect);
                     g.DrawRectangle(borderPen, t1Rect.X, t1Rect.Y, t1Rect.Width - 1, t1Rect.Height - 1);
-                    string stretchBadge = Math.Abs(seqStr - 1.0) > 0.01 ? string.Format(" • %{0:0}", seqStr * 100.0) : "";
-                    DrawBadge(g, "TABLA 1 (Düz Gövde [R1] / Yazı [R3] • 9.00 mm Klips) • Örnek: " + sampleNum + " [" + seqFont + " • " + seqH.ToString("F2", CultureInfo.InvariantCulture) + " mm" + stretchBadge + "]", t1Rect.X + 8, t1Rect.Y + 4, currentColor3);
+                    string stretchBadge = Math.Abs(seqStr - 1.0) > 0.01 ? string.Format("  ·  %{0:0}", seqStr * 100.0) : "";
                     DrawScaledProportionalText(g, sampleNum, seqFont, txt, t1Rect, seqH, klipsHeightMm, seqW, seqG, seqStr);
+                    DrawBadge(g, "TABLA 1  ·  DÜZ RENK" + stretchBadge, t1Rect.X + 6, t1Rect.Y + 5, currentColor3);
                 }
 
                 // 2. Tabla 2 (Çift Renk Gövde: Üst [R2], Alt [R1], Yazı [R3] • 9.00 mm Klips)
@@ -6274,9 +6883,9 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                     g.DrawLine(seamPen, t2Rect.Left, t2SplitY, t2Rect.Right, t2SplitY);
                     g.DrawRectangle(borderPen, t2Rect.X, t2Rect.Y, t2Rect.Width - 1, t2Rect.Height - 1);
 
-                    string stretchBadge = Math.Abs(seqStr - 1.0) > 0.01 ? string.Format(" • %{0:0}", seqStr * 100.0) : "";
-                    DrawBadge(g, "TABLA 2 (Çift Renk Gövde [R1/R2] / Yazı [R3] • 9.00 mm Klips) • Örnek: " + sampleNum + " [" + seqFont + " • " + seqH.ToString("F2", CultureInfo.InvariantCulture) + " mm" + stretchBadge + "]", t2Rect.X + 8, t2Rect.Y + 4, currentColor3);
+                    string stretchBadge = Math.Abs(seqStr - 1.0) > 0.01 ? string.Format("  ·  %{0:0}", seqStr * 100.0) : "";
                     DrawScaledProportionalText(g, sampleNum, seqFont, txt, t2Rect, seqH, klipsHeightMm, seqW, seqG, seqStr);
+                    DrawBadge(g, "TABLA 2  ·  ÇİFT RENK" + stretchBadge, t2Rect.X + 6, t2Rect.Y + 5, currentColor3);
                 }
             }
             else
@@ -6306,7 +6915,6 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                 double stretchTop = numStretchTop != null ? (double)numStretchTop.Value / 100.0 : 1.0;
                 double stretchBot = numStretchBot != null ? (double)numStretchBot.Value / 100.0 : 1.0;
 
-                string modeTag = currentMode == GeneratorMode.MarkaTipi ? "MARKA TİPİ (360° Dairesel)" : "İSİMLİ KLİPS";
 
                 // 1. Üst Bant (Gövde: Color 2, Yazı: Color 1)
                 Rectangle topRect = new Rectangle(0, 0, w, halfH);
@@ -6317,10 +6925,10 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                     g.FillRectangle(bgTop, topRect);
                     g.DrawRectangle(borderPen, topRect.X, topRect.Y, topRect.Width - 1, topRect.Height - 1);
 
-                    string stretchTopStr = Math.Abs(stretchTop - 1.0) > 0.01 ? string.Format(" • %{0:0}", stretchTop * 100.0) : "";
-                    DrawBadge(g, modeTag + " • ÜST BANT [" + fontTop + " • " + textHeightTop.ToString("F2", CultureInfo.InvariantCulture) + " mm" + stretchTopStr + "]", topRect.X + 8, topRect.Y + 4, currentColor1);
-
+                    string stretchTopStr = Math.Abs(stretchTop - 1.0) > 0.01 ? string.Format("  ·  %{0:0}", stretchTop * 100.0) : "";
                     DrawScaledProportionalText(g, topStr, fontTop, textTop, topRect, textHeightTop, bandHeightMm, boldnessTop, gapTop, stretchTop, useSoftG);
+
+                    DrawBadge(g, "ÜST" + stretchTopStr, topRect.X + 6, topRect.Y + 5, currentColor1);
                 }
 
                 // 2. Alt Bant (Gövde: Color 1, Yazı: Color 2)
@@ -6332,20 +6940,25 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                     g.FillRectangle(bgBot, botRect);
                     g.DrawRectangle(borderPen, botRect.X, botRect.Y, botRect.Width - 1, botRect.Height - 1);
 
-                    string stretchBotStr = Math.Abs(stretchBot - 1.0) > 0.01 ? string.Format(" • %{0:0}", stretchBot * 100.0) : "";
-                    DrawBadge(g, modeTag + " • ALT BANT [" + fontBot + " • " + textHeightBot.ToString("F2", CultureInfo.InvariantCulture) + " mm" + stretchBotStr + "]", botRect.X + 8, botRect.Y + 4, currentColor2);
-
+                    string stretchBotStr = Math.Abs(stretchBot - 1.0) > 0.01 ? string.Format("  ·  %{0:0}", stretchBot * 100.0) : "";
                     DrawScaledProportionalText(g, botStr, fontBot, textBot, botRect, textHeightBot, bandHeightMm, boldnessBot, gapBot, stretchBot, useSoftG);
+
+                    DrawBadge(g, "ALT" + stretchBotStr, botRect.X + 6, botRect.Y + 5, currentColor2);
                 }
             }
         }
 
         private void DrawBadge(Graphics g, string label, float x, float y, Color fg)
         {
-            using (Font badgeFont = new Font("Segoe UI", 6.5f, FontStyle.Bold))
-            using (Brush badgeBrush = new SolidBrush(Color.FromArgb(200, fg)))
+            // Küçük, okunaklı etiket: yarı saydam koyu zemin üzerinde beyaz yazı (her renkte okunur)
+            using (Font badgeFont = new Font("Segoe UI", 7f, FontStyle.Bold))
             {
-                g.DrawString(label, badgeFont, badgeBrush, new PointF(x, y));
+                SizeF sz = g.MeasureString(label, badgeFont);
+                RectangleF r = new RectangleF(x + 2, y + 2, sz.Width + 10, sz.Height + 3);
+                using (GraphicsPath bp = UiRound(r, r.Height / 2f))
+                using (Brush bg = new SolidBrush(Color.FromArgb(140, 15, 23, 42)))
+                    g.FillPath(bg, bp);
+                g.DrawString(label, badgeFont, Brushes.White, new PointF(r.X + 5, r.Y + 1.5f));
             }
         }
 
@@ -6374,7 +6987,7 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
             {
                 using (GraphicsPath gp = new GraphicsPath())
                 {
-                    gp.AddString("H0", ff, (int)style, refEmSize, new PointF(0, 0), StringFormat.GenericTypographic);
+                    gp.AddString("H", ff, (int)style, refEmSize, new PointF(0, 0), StringFormat.GenericTypographic);
                     RectangleF b = gp.GetBounds();
                     if (b.Height > 10f) capHeightAtRef = b.Height;
                 }
@@ -6396,6 +7009,8 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                 float textMinY = float.MaxValue;
                 float textMaxY = float.MinValue;
                 int gIdx = 0;
+                float clearancePx = (float)((0.65 + Math.Min(0.0, charGapMm)) * pxPerMm);
+                float prevRightPx = float.MinValue;
 
                 for (int i = 0; i < text.Length; i++)
                 {
@@ -6409,6 +7024,12 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                     RectangleF b = gpChar.GetBounds();
 
                     float originX = nb.X + (gIdx * extraGapPx);
+                    if (gIdx > 0 && prevRightPx > float.MinValue)
+                    {
+                        float reqOriginX = prevRightPx + clearancePx - (b.Left - boldnessPx);
+                        if (originX < reqOriginX) originX = reqOriginX;
+                    }
+                    prevRightPx = originX + b.Right + boldnessPx;
                     chars.Add(c);
                     charPaths.Add(gpChar);
                     charOriginsX.Add(originX);
@@ -6426,14 +7047,50 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
 
                 if (chars.Count == 0) return;
 
+                // Üreticiyle aynı kural: aksanlar banda sığmıyorsa yalnızca aksanları basıklaştır,
+                // yine sığmıyorsa tüm yazıyı dikeyde küçült.
+                {
+                    RectangleF hb;
+                    using (GraphicsPath gpH = new GraphicsPath())
+                    {
+                        gpH.AddString("H", ff, (int)style, emSize, new PointF(0, 0), StringFormat.GenericTypographic);
+                        hb = gpH.GetBounds();
+                    }
+                    double allowedMm = bandHeightMm > 5.0 ? 7.60 : 4.00;
+                    double embossMm = numEmboss != null ? (double)numEmboss.Value : 0.0;
+                    double chamferDeg = numChamfer != null ? (double)numChamfer.Value : 0.0;
+                    double chamferMm = (chamferDeg > 0.0 && chamferDeg < 89.0 && embossMm > 1e-4) ? embossMm / Math.Tan(chamferDeg * Math.PI / 180.0) : 0.0;
+                    float allowedPx = (float)((allowedMm - chamferMm) * pxPerMm);
+                    float abovePx = Math.Max(0f, hb.Top - textMinY) * stretchY;
+                    float belowPx = Math.Max(0f, textMaxY - hb.Bottom) * stretchY;
+                    double k = AccentCompressionFactor(targetHeightPx * stretchY, abovePx, belowPx, allowedPx);
+                    if (k < 0.999)
+                    {
+                        textMinY = float.MaxValue; textMaxY = float.MinValue;
+                        for (int ci = 0; ci < charPaths.Count; ci++)
+                        {
+                            charPaths[ci] = CompactAccents(charPaths[ci], hb.Top, hb.Bottom, (float)k);
+                            RectangleF nb = charPaths[ci].GetBounds();
+                            if (nb.Top < textMinY) textMinY = nb.Top;
+                            if (nb.Bottom > textMaxY) textMaxY = nb.Bottom;
+                        }
+                    }
+                    float totalPx = (textMaxY - textMinY + 2f * boldnessPx) * stretchY;
+                    if (totalPx > allowedPx && totalPx > 0f) stretchY *= allowedPx / totalPx;
+                }
+
                 float totalW = maxRightPx - minLeftPx;
                 float textCenterY = (textMinY + textMaxY) * 0.5f;
 
-                float startX = rect.X + (rect.Width - totalW) / 2f - minLeftPx;
+                // Yazı banda sığmıyorsa yatayda sıkıştır (üretici de uzun yazıyı yay boyunca yatayda sıkıştırır)
+                float availW = rect.Width - 16f;
+                float fitX = (totalW > availW && totalW > 0f) ? availW / totalW : 1.0f;
+                float midX = rect.X + rect.Width / 2f;
+                float textMidLocal = minLeftPx + totalW / 2f;
                 float cy = rect.Y + rect.Height / 2f;
 
                 GraphicsState clipState = g.Save();
-                g.SetClip(rect);
+                g.SetClip(rect, CombineMode.Intersect);
 
                 try
                 {
@@ -6448,10 +7105,10 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                             GraphicsState gState = g.Save();
                             try
                             {
-                                g.TranslateTransform(startX + originX, cy);
-                                if (Math.Abs(stretchY - 1.0f) > 0.001f)
+                                g.TranslateTransform(midX + (originX - textMidLocal) * fitX, cy);
+                                if (Math.Abs(stretchY - 1.0f) > 0.001f || fitX < 0.999f)
                                 {
-                                    g.ScaleTransform(1.0f, stretchY);
+                                    g.ScaleTransform(fitX, stretchY);
                                 }
                                 g.TranslateTransform(0, -textCenterY);
 
@@ -6488,11 +7145,11 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                 string seqFont = cmbSeqFont != null && cmbSeqFont.SelectedItem != null ? cmbSeqFont.SelectedItem.ToString() : "Trebuchet MS";
                 double seqH = numSeqHeight != null ? (double)numSeqHeight.Value : 3.80;
                 double seqStr = numSeqStretch != null ? (double)numSeqStretch.Value : 100.0;
-                if (grpPreview != null) grpPreview.Text = " 4. Sıralı Klips Canlı Önizleme (" + seqFont + " • 9.00 mm Klips / Tabla 1 & 2) ";
+                if (grpPreview != null) grpPreview.Text = "Önizleme";
                 if (lblScaleInfo != null)
                 {
                     lblScaleInfo.Text = string.Format(CultureInfo.InvariantCulture,
-                "{0} • {1:F2} mm • 9.00 mm Klips • Çift Tabla (1: Düz • 2: Çift)",
+                "{0}  ·  {1:F2} mm  ·  9 mm klips",
                 seqFont, seqH);
                 }
             }
@@ -6505,27 +7162,20 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
 
                 try
                 {
-                    if (txtTopText != null) txtTopText.Font = CreateSafeFont(fontTop, 10.5f);
-                    if (txtBotText != null) txtBotText.Font = CreateSafeFont(fontBot, 10.5f);
+                    if (txtTopText != null) txtTopText.Font = CreateSafeFont(fontTop, 13f);
+                    if (txtBotText != null) txtBotText.Font = CreateSafeFont(fontBot, 13f);
                 }
                 catch { }
 
-                if (grpPreview != null)
-                {
-                    string prefix = currentMode == GeneratorMode.MarkaTipi ? " 4. Canlı Önizleme (360° Dairesel: " : " 4. Canlı Önizleme (Klipsli: ";
-                    if (string.Equals(fontTop, fontBot, StringComparison.OrdinalIgnoreCase))
-                        grpPreview.Text = prefix + fontTop + " • 4.50 mm Bant) ";
-                    else
-                        grpPreview.Text = prefix + "Üst: " + fontTop + " | Alt: " + fontBot + ") ";
-                }
+                if (grpPreview != null) grpPreview.Text = "Önizleme";
 
                 if (lblScaleInfo != null)
                 {
                     double strTop = numStretchTop != null ? (double)numStretchTop.Value : 100.0;
                     double strBot = numStretchBot != null ? (double)numStretchBot.Value : 100.0;
-                    lblScaleInfo.Text = string.Format(CultureInfo.InvariantCulture,
-                "Üst: {0:F2} mm | Alt: {1:F2} mm • Çift Tabla (1: Düz • 2: Çift)",
-                        hTop, hBot);
+                    lblScaleInfo.Text = string.Equals(fontTop, fontBot, StringComparison.OrdinalIgnoreCase)
+                        ? string.Format(CultureInfo.InvariantCulture, "{0}  ·  üst {1:F2} mm  ·  alt {2:F2} mm", fontTop, hTop, hBot)
+                        : string.Format(CultureInfo.InvariantCulture, "Üst: {0} {1:F2} mm  ·  Alt: {2} {3:F2} mm", fontTop, hTop, fontBot, hBot);
                 }
             }
 
@@ -6679,6 +7329,7 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
             string baseDir = usingInternalTemplate ? exeDir : bakDirNorm;
             double emboss = (double)numEmboss.Value;
             double embed = (double)numEmbed.Value;
+            if (numChamfer != null) PigeonRingGenerator.DefaultOverhangChamferDeg = (double)numChamfer.Value;
             string material = cmbMaterial.SelectedItem != null ? cmbMaterial.SelectedItem.ToString() : "PLA";
             string color1Hex = ColorToHex(currentColor1);
             string color2Hex = ColorToHex(currentColor2);
@@ -6744,6 +7395,7 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
             btnGenerate.Enabled = false;
             btnGenerate.Text = "Oluşturuluyor...";
             txtLog.Clear();
+            SetLogDrawer(true);
 
             if (currentMode == GeneratorMode.SiraliKlips)
             {
@@ -6773,7 +7425,7 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                     this.Invoke(new Action(() =>
                     {
                         btnGenerate.Enabled = true;
-                        btnGenerate.Text = "▶  SIRALI KLİPS 3MF (ÇİFT TABLA) OLUŞTUR";
+                        btnGenerate.Text = GenerateButtonText();
 
                         if (success)
                         {
@@ -6783,6 +7435,7 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                         }
                         else
                         {
+                            ShowLogWindow();
                             MessageBox.Show("Üretim sırasında bir hata meydana geldi. Detayları işlem günlüğünden inceleyebilirsiniz.",
                                 "Hata", MessageBoxButtons.OK, MessageBoxIcon.Error);
                         }
@@ -6824,7 +7477,7 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                     this.Invoke(new Action(() =>
                     {
                         btnGenerate.Enabled = true;
-                        btnGenerate.Text = isMarka ? "▶  MARKA TİPİ 3MF OLUŞTUR" : "▶  3MF DOSYASINI OLUŞTUR";
+                        btnGenerate.Text = GenerateButtonText();
 
                         if (success)
                         {
@@ -6834,6 +7487,7 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                         }
                         else
                         {
+                            ShowLogWindow();
                             MessageBox.Show("Üretim sırasında bir hata meydana geldi. Detayları işlem günlüğünden inceleyebilirsiniz.",
                                 "Hata", MessageBoxButtons.OK, MessageBoxIcon.Error);
                         }
@@ -7062,6 +7716,8 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                 numEmboss.Value = (decimal)cfg.EmbossMm;
             if (cfg.EmbedMm >= (double)numEmbed.Minimum && cfg.EmbedMm <= (double)numEmbed.Maximum)
                 numEmbed.Value = (decimal)cfg.EmbedMm;
+            if (numChamfer != null && cfg.OverhangChamferDeg >= (double)numChamfer.Minimum && cfg.OverhangChamferDeg <= (double)numChamfer.Maximum)
+                numChamfer.Value = (decimal)Math.Round(cfg.OverhangChamferDeg);
 
             if (!string.IsNullOrEmpty(cfg.Material))
             {
@@ -7148,6 +7804,7 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
 
             cfg.EmbossMm = (double)numEmboss.Value;
             cfg.EmbedMm = (double)numEmbed.Value;
+            if (numChamfer != null) cfg.OverhangChamferDeg = (double)numChamfer.Value;
             cfg.UseSoftG = (chkSoftG != null && chkSoftG.Checked);
             cfg.Material = cmbMaterial.SelectedItem != null ? cmbMaterial.SelectedItem.ToString() : "PLA";
             cfg.SpeedProfile = (rbSpeedSlow != null && rbSpeedSlow.Checked) ? "slow" : "fast";
@@ -7220,7 +7877,7 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
             string bak = GetDefaultBakPath("BOS_KLIPS_9MM.3mf.bak");
             string outP = Path.Combine(cliExeDir, "BEKİR ATLI Klips.3mf");
             double emboss = 0.20;
-            double embed = 0.40;
+            double embed = 0.60;
             string fontTop = "Bahnschrift";
             string fontBot = "Bahnschrift";
             double textHTop = 3.50;
@@ -7250,12 +7907,15 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                 else if (args[i] == "--bak" && i + 1 < args.Length) bak = args[++i];
                 else if (args[i] == "--out" && i + 1 < args.Length) outP = args[++i];
                 else if (args[i] == "--font" && i + 1 < args.Length) { fontTop = args[++i]; fontBot = fontTop; }
+                else if (args[i] == "--height" && i + 1 < args.Length) { textHTop = double.Parse(args[++i], CultureInfo.InvariantCulture); textHBot = textHTop; }
                 else if (args[i] == "--emboss" && i + 1 < args.Length) emboss = double.Parse(args[++i], CultureInfo.InvariantCulture);
+                else if (args[i] == "--gap" && i + 1 < args.Length) { gapTop = double.Parse(args[++i], CultureInfo.InvariantCulture); gapBot = gapTop; }
                 else if (args[i] == "--mat" && i + 1 < args.Length) material = args[++i];
                 else if (args[i] == "--layer" && i + 1 < args.Length) seqLayer = double.Parse(args[++i], CultureInfo.InvariantCulture);
                 else if (args[i] == "--marka") isMarka = true;
                 else if (args[i] == "--seq") isSeq = true;
                 else if (args[i] == "--end" && i + 1 < args.Length) seqEnd = int.Parse(args[++i], CultureInfo.InvariantCulture);
+                else if (args[i] == "--chamfer" && i + 1 < args.Length) DefaultOverhangChamferDeg = double.Parse(args[++i], CultureInfo.InvariantCulture);
             }
 
             bool ok;

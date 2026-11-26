@@ -1980,7 +1980,7 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
         double charGapWorld, double targetSpanDeg = 0, double boldnessWorld = 0.0, double maxAllowedSpanDeg = 252.0,
         double verticalStretch = 1.0, bool isCircularRing = false, double circularRadiusLocal = 4.50,
         double rootChamferWorld = 0.0, bool useTurkishFix = true, RingSurfaceSampler surfaceSampler = null,
-        double overhangChamferDeg = -1.0)
+        double overhangChamferDeg = -1.0, bool autoSpread = false)
     {
         if (overhangChamferDeg < 0.0) overhangChamferDeg = DefaultOverhangChamferDeg;
         SolidMesh mesh = new SolidMesh();
@@ -2148,7 +2148,7 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
             fitRatio = maxSafeWidthWorld / textTotalWidthWorld;
             textTotalWidthWorld = maxSafeWidthWorld;
         }
-        else if (textTotalWidthWorld < maxSafeWidthWorld && textTotalWidthWorld > 0 && charOriginsX.Count > 1 && charGapWorld >= 0.0 && charGapWorld <= 0.05)
+        else if (autoSpread && textTotalWidthWorld < maxSafeWidthWorld && textTotalWidthWorld > 0 && charOriginsX.Count > 1 && charGapWorld >= 0.0 && charGapWorld <= 0.05)
         {
             double remainingWorld = maxSafeWidthWorld - textTotalWidthWorld;
             double extraPerGapWorld = remainingWorld / (charOriginsX.Count - 1);
@@ -3290,7 +3290,8 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                                                    string color3Hex = "#FFFFFF",
                                                    double stretchY = 100.0,
                                                    string speedProfile = "fast",
-                                                   double layerHeight = 0.12)
+                                                   double layerHeight = 0.12,
+                                                   bool autoSpread = false)
     {
         output3mf = output3mf.Trim('"', '\'').TrimEnd('\\', '/');
         string logPath = Path.Combine(GetAppDataDir(), "generator.log");
@@ -3391,7 +3392,7 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
             {
                 string lbl = labels[i];
                 LastTextFitNote = null;
-                SolidMesh tm = GenerateDistributedCylindricalText(lbl, fontName, textHeightWorld, splitZ, 236.0, embedMm, embossMm, dynZScale, charGapMm, 0, widthScale, 258.0, stretchY / 100.0, false, 0.0, 0.0, true, surfaceSampler);
+                SolidMesh tm = GenerateDistributedCylindricalText(lbl, fontName, textHeightWorld, splitZ, 236.0, embedMm, embossMm, dynZScale, charGapMm, 0, widthScale, 258.0, stretchY / 100.0, false, 0.0, 0.0, true, surfaceSampler, -1.0, autoSpread);
                 if (LastTextFitNote != null) fullLog(LastTextFitNote);
                 textMeshes.Add(tm);
                 fullLog(string.Format("  -> [{0}/{1}] Yazı '{2}': {3} köşe, {4} üçgen", i + 1, count, lbl, tm.Vertices.Count, tm.Triangles.Count));
@@ -3997,6 +3998,1092 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
         }
     }
 
+    /// <summary>OrcaSlicer paint_color kodu: extruder 1="4", 2="8", 3="0C", 4="1C" ...</summary>
+    /// <summary>Toplu üretim sırası: renk çifti, sonra isim, sonra adet. Her eleman { isimIdx, çiftIdx }.</summary>
+    public static List<int[]> BuildBatchInstances(int nNames, List<int[]> combos)
+    {
+        List<int[]> instances = new List<int[]>();
+        for (int c = 0; c < combos.Count; c++)
+            for (int n = 0; n < nNames; n++)
+                for (int q = 0; q < combos[c][2]; q++)
+                    instances.Add(new int[] { n, c });
+        return instances;
+    }
+
+    /// <summary>Tabla içi ızgara yerleşimi (tabla koordinatında, mm). Hem üretim hem önizleme bunu kullanır.</summary>
+    public static void ComputeBatchLayout(int count, int perPlate, out double[] lx, out double[] ly, out int[] plateOf)
+    {
+        const double stepXY = 20.0;
+        if (perPlate < 1) perPlate = 40;
+        lx = new double[count]; ly = new double[count]; plateOf = new int[count];
+        int plateCount = (count + perPlate - 1) / perPlate;
+        for (int p = 0; p < plateCount; p++)
+        {
+            int first = p * perPlate;
+            int nOn = Math.Min(perPlate, count - first);
+            int cols = Math.Max(4, (int)Math.Ceiling(Math.Sqrt(nOn * 1.3)));
+            int rows = (nOn + cols - 1) / cols;
+            double sx = 135.0 - (cols - 1) * stepXY * 0.5;
+            double sy = 130.0 - (rows - 1) * stepXY * 0.5;
+            for (int k = 0; k < nOn; k++)
+            {
+                lx[first + k] = sx + (k % cols) * stepXY;
+                ly[first + k] = sy + (k / cols) * stepXY;
+                plateOf[first + k] = p;
+            }
+        }
+    }
+
+    public class BatchTextSettings
+    {
+        public string FontTop = "Trebuchet MS", FontBot = "Trebuchet MS", FontSeq = "Trebuchet MS";
+        public double HTop = 3.4, HBot = 3.4, HSeq = 7.0;
+        public double GTop, GBot, GSeq;
+        public double WTop, WBot, WSeq;
+        public double STop = 100, SBot = 100, SSeq = 100;
+        public double Emboss = 0.6, Embed = 0.3;
+        public bool TurkishFix = true, AutoSpread;
+    }
+
+    /// <summary>Önizleme için üçgen listesi: P (üçgen başına 9 float, mm), C (üçgen başına ARGB).</summary>
+    public class PreviewMesh
+    {
+        public float[] P;
+        public int[] C;
+        public int[] Obj;   // isteğe bağlı: üçgenin nesne numarası (tıklayarak seçme için)
+        public int Count { get { return C == null ? 0 : C.Length; } }
+    }
+
+    private static readonly object previewLock = new object();
+    private static string previewTplPath;
+    private static SolidMesh previewWhole, previewTwo;
+    private static List<string> previewPaint;
+    private static RingSurfaceSampler previewSampler;
+    private static double previewSplitZ, previewOrigH, previewDynZ;
+
+    public static string ReadRingXmlFromTemplate(string backup3mf)
+    {
+        string ringXml = "";
+        using (ZipArchive zip = ZipFile.OpenRead(backup3mf))
+        {
+            foreach (var e in zip.Entries)
+            {
+                if (e.FullName.EndsWith(".model", StringComparison.OrdinalIgnoreCase) && !e.FullName.Contains("3dmodel.model"))
+                {
+                    using (StreamReader sr = new StreamReader(e.Open(), Encoding.UTF8)) ringXml = sr.ReadToEnd();
+                    break;
+                }
+            }
+            if (string.IsNullOrEmpty(ringXml))
+            {
+                var mEntry = zip.GetEntry("3D/3dmodel.model");
+                if (mEntry != null)
+                    using (StreamReader sr = new StreamReader(mEntry.Open(), Encoding.UTF8)) ringXml = sr.ReadToEnd();
+            }
+        }
+        return ringXml;
+    }
+
+    /// <summary>Tek bir toplu klipsin (gövde + yazılar) renkli önizleme modeli; üretimdeki geometrinin aynısı.</summary>
+    public static PreviewMesh BuildClipPreview(string backup3mf, string[] entry, Color dark, Color light, BatchTextSettings t)
+    {
+        lock (previewLock)
+        {
+            if (previewTplPath != backup3mf || previewWhole == null)
+            {
+                string xml = ReadRingXmlFromTemplate(backup3mf);
+                if (string.IsNullOrEmpty(xml)) throw new InvalidOperationException("Şablon okunamadı: " + backup3mf);
+                previewWhole = ParseMeshFromModelXml(xml);
+                previewTwo = BuildTwoColorBody(previewWhole, out previewPaint);
+                double mn = double.MaxValue, mx = double.MinValue;
+                foreach (var v in previewWhole.Vertices) { if (v.z < mn) mn = v.z; if (v.z > mx) mx = v.z; }
+                previewOrigH = (mx > mn) ? (mx - mn) : 7.168;
+                previewSplitZ = (mn + mx) * 0.5;
+                previewDynZ = 9.000 / previewOrigH;
+                previewSampler = new RingSurfaceSampler(previewWhole, 0.0, -0.2754);
+                previewTplPath = backup3mf;
+            }
+
+            List<SolidMesh> meshes = new List<SolidMesh>();
+            List<Func<int, int>> colorOf = new List<Func<int, int>>();
+            int dk = dark.ToArgb(), lt = light.ToArgb();
+            if (IsSeqEntry(entry))
+            {
+                meshes.Add(previewWhole); colorOf.Add(i => dk);
+                SolidMesh ts = GenerateDistributedCylindricalText(entry[0], t.FontSeq, Math.Min(9.0, t.HSeq), previewSplitZ, 236.0, t.Embed, t.Emboss, previewDynZ, t.GSeq, 0, t.WSeq, 258.0, t.SSeq / 100.0, false, 0.0, 0.0, true, previewSampler, -1.0, t.AutoSpread);
+                meshes.Add(ts); colorOf.Add(i => lt);
+            }
+            else
+            {
+                List<string> paint = previewPaint;
+                meshes.Add(previewTwo); colorOf.Add(i => (paint != null && i < paint.Count && !string.IsNullOrEmpty(paint[i])) ? lt : dk);
+                double q = previewOrigH * 0.25;
+                SolidMesh tt = GenerateDistributedCylindricalText(entry[0], t.FontTop, t.HTop, previewSplitZ + q, 236.0, t.Embed, t.Emboss, previewDynZ, t.GTop, 0, t.WTop, 258.0, t.STop / 100.0, false, 0.0, 0.0, t.TurkishFix, previewSampler, -1.0, t.AutoSpread);
+                SolidMesh tb = GenerateDistributedCylindricalText(entry[1], t.FontBot, t.HBot, previewSplitZ - q, 236.0, t.Embed, t.Emboss, previewDynZ, t.GBot, 0, t.WBot, 258.0, t.SBot / 100.0, false, 0.0, 0.0, t.TurkishFix, previewSampler, -1.0, t.AutoSpread);
+                meshes.Add(tt); colorOf.Add(i => dk);
+                meshes.Add(tb); colorOf.Add(i => lt);
+            }
+
+            int total = 0;
+            foreach (var m in meshes) total += m.Triangles.Count;
+            PreviewMesh pm = new PreviewMesh { P = new float[total * 9], C = new int[total] };
+            int k = 0;
+            double zs = previewDynZ;
+            for (int mi = 0; mi < meshes.Count; mi++)
+            {
+                SolidMesh m = meshes[mi];
+                for (int ti = 0; ti < m.Triangles.Count; ti++)
+                {
+                    Tri tr = m.Triangles[ti];
+                    Vec3 a = m.Vertices[tr.v1], b = m.Vertices[tr.v2], c = m.Vertices[tr.v3];
+                    int o = k * 9;
+                    pm.P[o] = (float)a.x; pm.P[o + 1] = (float)a.y; pm.P[o + 2] = (float)(a.z * zs);
+                    pm.P[o + 3] = (float)b.x; pm.P[o + 4] = (float)b.y; pm.P[o + 5] = (float)(b.z * zs);
+                    pm.P[o + 6] = (float)c.x; pm.P[o + 7] = (float)c.y; pm.P[o + 8] = (float)(c.z * zs);
+                    pm.C[k] = colorOf[mi](ti);
+                    k++;
+                }
+            }
+            return pm;
+        }
+    }
+
+    /// <summary>Üretilmiş bir 3MF projesinin önizleme verisi: her nesne kendi tablasının koordinatında, renkleriyle.</summary>
+    public class ProjectPreview
+    {
+        public List<string> Names = new List<string>();
+        public List<int> PlateOf = new List<int>();
+        public List<PreviewMesh> Meshes = new List<PreviewMesh>();
+        public int Plates = 1;
+        public string[] FilamentHex = new string[0];
+    }
+
+    private static double[] Parse3mfTransform(string s)
+    {
+        double[] m = { 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0 };
+        if (string.IsNullOrEmpty(s)) return m;
+        string[] parts = s.Split(new[] { ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length != 12) return m;
+        for (int i = 0; i < 12; i++) m[i] = double.Parse(parts[i], CultureInfo.InvariantCulture);
+        return m;
+    }
+
+    // 3MF satır vektörü kuralı: p' = p * M + t
+    private static void Apply3mf(double[] m, double x, double y, double z, out double ox, out double oy, out double oz)
+    {
+        ox = x * m[0] + y * m[3] + z * m[6] + m[9];
+        oy = x * m[1] + y * m[4] + z * m[7] + m[10];
+        oz = x * m[2] + y * m[5] + z * m[8] + m[11];
+    }
+
+    private static int PaintCodeToExtruder(string code)
+    {
+        if (string.IsNullOrEmpty(code)) return 0;
+        if (code == "4") return 1;
+        if (code == "8") return 2;
+        if (code.Length == 2 && code[1] == 'C')
+        {
+            int v;
+            if (int.TryParse(code.Substring(0, 1), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out v)) return v + 3;
+        }
+        return 0;
+    }
+
+    private class Pv3mfMesh { public List<float> V = new List<float>(); public List<int> T = new List<int>(); public List<string> P = new List<string>(); }
+
+    /// <summary>Programın yazdığı 3MF'i okuyup her yerleştirilmiş nesneyi renkli üçgenlere çevirir.</summary>
+    public static ProjectPreview LoadProjectPreview(string path)
+    {
+        ProjectPreview pp = new ProjectPreview();
+        string modelXml = null, settingsXml = null, projectJson = null;
+        using (ZipArchive zip = ZipFile.OpenRead(path))
+        {
+            Func<string, string> read = n =>
+            {
+                var e = zip.GetEntry(n);
+                if (e == null) return null;
+                using (StreamReader sr = new StreamReader(e.Open(), Encoding.UTF8)) return sr.ReadToEnd();
+            };
+            modelXml = read("3D/3dmodel.model");
+            settingsXml = read("Metadata/model_settings.config");
+            projectJson = read("Metadata/project_settings.config");
+        }
+        if (modelXml == null) throw new InvalidOperationException("3D/3dmodel.model bulunamadı.");
+
+        // Filament renkleri
+        List<string> fil = new List<string>();
+        if (projectJson != null)
+        {
+            var fm = System.Text.RegularExpressions.Regex.Match(projectJson, "\"filament_colour\"\\s*:\\s*\\[(.*?)\\]", System.Text.RegularExpressions.RegexOptions.Singleline);
+            if (fm.Success)
+                foreach (System.Text.RegularExpressions.Match h in System.Text.RegularExpressions.Regex.Matches(fm.Groups[1].Value, "\"(#[0-9A-Fa-f]{6})"))
+                    fil.Add(h.Groups[1].Value);
+        }
+        pp.FilamentHex = fil.ToArray();
+        int[] filArgb = new int[Math.Max(1, fil.Count)];
+        for (int i = 0; i < fil.Count; i++) filArgb[i] = ColorTranslator.FromHtml(fil[i]).ToArgb();
+        if (fil.Count == 0) filArgb[0] = Color.Silver.ToArgb();
+
+        // model_settings: nesne adı, parça extruder'ları, tablalar
+        Dictionary<string, string> objName = new Dictionary<string, string>();
+        Dictionary<string, int> objExt = new Dictionary<string, int>();
+        Dictionary<string, Dictionary<string, int>> partExt = new Dictionary<string, Dictionary<string, int>>();
+        Dictionary<string, int> objPlate = new Dictionary<string, int>();
+        int plateCount = 0;
+        if (settingsXml != null)
+        {
+            XmlDocument doc = new XmlDocument();
+            doc.LoadXml(settingsXml);
+            foreach (XmlNode o in doc.SelectNodes("/config/object"))
+            {
+                string id = o.Attributes["id"] != null ? o.Attributes["id"].Value : "";
+                foreach (XmlNode md in o.SelectNodes("metadata"))
+                {
+                    string k = md.Attributes["key"] != null ? md.Attributes["key"].Value : "";
+                    string v = md.Attributes["value"] != null ? md.Attributes["value"].Value : "";
+                    if (k == "name") objName[id] = v;
+                    else if (k == "extruder") { int ex; if (int.TryParse(v, out ex)) objExt[id] = ex; }
+                }
+                Dictionary<string, int> pe = new Dictionary<string, int>();
+                foreach (XmlNode part in o.SelectNodes("part"))
+                {
+                    string pid = part.Attributes["id"] != null ? part.Attributes["id"].Value : "";
+                    XmlNode em = part.SelectSingleNode("metadata[@key='extruder']");
+                    int ex;
+                    if (em != null && int.TryParse(em.Attributes["value"].Value, out ex)) pe[pid] = ex;
+                }
+                partExt[id] = pe;
+            }
+            foreach (XmlNode pl in doc.SelectNodes("/config/plate"))
+            {
+                foreach (XmlNode mi in pl.SelectNodes("model_instance/metadata[@key='object_id']"))
+                    objPlate[mi.Attributes["value"].Value] = plateCount;
+                plateCount++;
+            }
+        }
+        pp.Plates = Math.Max(1, plateCount);
+
+        // 3dmodel.model: mesh nesneleri, bileşenler ve yerleşimler
+        Dictionary<string, Pv3mfMesh> meshes = new Dictionary<string, Pv3mfMesh>();
+        Dictionary<string, List<KeyValuePair<string, double[]>>> comps = new Dictionary<string, List<KeyValuePair<string, double[]>>>();
+        List<KeyValuePair<string, double[]>> items = new List<KeyValuePair<string, double[]>>();
+        using (XmlReader xr = XmlReader.Create(new StringReader(modelXml), new XmlReaderSettings { IgnoreWhitespace = true, IgnoreComments = true }))
+        {
+            string curObj = null;
+            Pv3mfMesh cur = null;
+            while (xr.Read())
+            {
+                if (xr.NodeType != XmlNodeType.Element) continue;
+                switch (xr.LocalName)
+                {
+                    case "object":
+                        curObj = xr.GetAttribute("id"); cur = null;
+                        break;
+                    case "mesh":
+                        cur = new Pv3mfMesh(); meshes[curObj] = cur;
+                        break;
+                    case "vertex":
+                        cur.V.Add(float.Parse(xr.GetAttribute("x"), CultureInfo.InvariantCulture));
+                        cur.V.Add(float.Parse(xr.GetAttribute("y"), CultureInfo.InvariantCulture));
+                        cur.V.Add(float.Parse(xr.GetAttribute("z"), CultureInfo.InvariantCulture));
+                        break;
+                    case "triangle":
+                        cur.T.Add(int.Parse(xr.GetAttribute("v1"))); cur.T.Add(int.Parse(xr.GetAttribute("v2"))); cur.T.Add(int.Parse(xr.GetAttribute("v3")));
+                        cur.P.Add(xr.GetAttribute("paint_color"));
+                        break;
+                    case "component":
+                        if (!comps.ContainsKey(curObj)) comps[curObj] = new List<KeyValuePair<string, double[]>>();
+                        comps[curObj].Add(new KeyValuePair<string, double[]>(xr.GetAttribute("objectid"), Parse3mfTransform(xr.GetAttribute("transform"))));
+                        break;
+                    case "item":
+                        items.Add(new KeyValuePair<string, double[]>(xr.GetAttribute("objectid"), Parse3mfTransform(xr.GetAttribute("transform"))));
+                        break;
+                }
+            }
+        }
+
+        int plateCols = (int)Math.Ceiling(Math.Sqrt(pp.Plates));
+        const double plateStride = 350.0;
+        foreach (var it in items)
+        {
+            string oid = it.Key;
+            int plate = objPlate.ContainsKey(oid) ? objPlate[oid] : 0;
+            double offX = (plate % plateCols) * plateStride, offY = -(plate / plateCols) * plateStride;
+            int defExt = objExt.ContainsKey(oid) ? objExt[oid] : 1;
+            List<KeyValuePair<string, double[]>> parts = comps.ContainsKey(oid) ? comps[oid]
+                : new List<KeyValuePair<string, double[]>> { new KeyValuePair<string, double[]>(oid, Parse3mfTransform(null)) };
+
+            List<float> P = new List<float>();
+            List<int> C = new List<int>();
+            foreach (var part in parts)
+            {
+                Pv3mfMesh m;
+                if (!meshes.TryGetValue(part.Key, out m)) continue;
+                int ext = defExt;
+                Dictionary<string, int> pe;
+                if (partExt.TryGetValue(oid, out pe) && pe.ContainsKey(part.Key)) ext = pe[part.Key];
+                int nv = m.V.Count / 3;
+                float[] w = new float[nv * 3];
+                for (int v = 0; v < nv; v++)
+                {
+                    double x1, y1, z1, x2, y2, z2;
+                    Apply3mf(part.Value, m.V[v * 3], m.V[v * 3 + 1], m.V[v * 3 + 2], out x1, out y1, out z1);
+                    Apply3mf(it.Value, x1, y1, z1, out x2, out y2, out z2);
+                    w[v * 3] = (float)(x2 - offX); w[v * 3 + 1] = (float)(y2 - offY); w[v * 3 + 2] = (float)z2;
+                }
+                for (int t = 0; t < m.P.Count; t++)
+                {
+                    for (int j = 0; j < 3; j++)
+                    {
+                        int vi = m.T[t * 3 + j];
+                        P.Add(w[vi * 3]); P.Add(w[vi * 3 + 1]); P.Add(w[vi * 3 + 2]);
+                    }
+                    int e = PaintCodeToExtruder(m.P[t]);
+                    if (e == 0) e = ext;
+                    C.Add(filArgb[Math.Max(0, Math.Min(filArgb.Length - 1, e - 1))]);
+                }
+            }
+            pp.Names.Add(objName.ContainsKey(oid) ? objName[oid] : "Nesne " + oid);
+            pp.PlateOf.Add(plate);
+            pp.Meshes.Add(new PreviewMesh { P = P.ToArray(), C = C.ToArray() });
+        }
+        return pp;
+    }
+
+    /// <summary>Bir tablanın tüm nesnelerini tek modelde birleştirir (tabla zemini dahil). Obj: üçgenin nesne numarası, zemin -1.</summary>
+    public static PreviewMesh BuildPlatePreview(ProjectPreview pp, int plate, double bedMm)
+    {
+        int total = 2;
+        for (int i = 0; i < pp.Meshes.Count; i++) if (pp.PlateOf[i] == plate) total += pp.Meshes[i].Count;
+        PreviewMesh pm = new PreviewMesh { P = new float[total * 9], C = new int[total], Obj = new int[total] };
+        float b = (float)bedMm;
+        float[] bed = { 0, 0, -0.05f, b, 0, -0.05f, b, b, -0.05f, 0, 0, -0.05f, b, b, -0.05f, 0, b, -0.05f };
+        Array.Copy(bed, pm.P, 18);
+        pm.C[0] = pm.C[1] = Color.FromArgb(205, 211, 220).ToArgb();
+        pm.Obj[0] = pm.Obj[1] = -1;
+        int k = 2;
+        for (int i = 0; i < pp.Meshes.Count; i++)
+        {
+            if (pp.PlateOf[i] != plate) continue;
+            PreviewMesh m = pp.Meshes[i];
+            Array.Copy(m.P, 0, pm.P, k * 9, m.P.Length);
+            Array.Copy(m.C, 0, pm.C, k, m.C.Length);
+            for (int t = 0; t < m.Count; t++) pm.Obj[k + t] = i;
+            k += m.Count;
+        }
+        return pm;
+    }
+
+    public static bool IsSeqEntry(string[] e)
+    {
+        return e.Length < 2 || e[1] == null;
+    }
+
+    public static string PaintCodeForExtruder(int ext)
+    {
+        if (ext == 1) return "4";
+        if (ext == 2) return "8";
+        return string.Format("{0:X}C", ext - 3);
+    }
+
+    /// <summary>
+    /// Toplu üretim: birden çok isim (üst/alt yazı) x koyu-açık renk çiftleri x adet, hepsi tek 3MF'te.
+    /// combos[i] = { koyu extruder (1-4), açık extruder (1-4), isim başına adet }.
+    /// Koyu renk: alt gövde + üst yazı; açık renk: üst gövde + alt yazı (İsimli klipsin çift renk tablasıyla aynı düzen).
+    /// </summary>
+    public static bool ExecuteBatchGeneration(string backup3mf, string output3mf,
+                                              List<string[]> names, List<int[]> combos, string[] filamentHex,
+                                              double embossMm, double embedMm,
+                                              string fontTop, string fontBot,
+                                              double textHeightTopMm, double textHeightBotMm,
+                                              double charGapTopMm, double charGapBotMm,
+                                              double widthScaleTop, double widthScaleBot,
+                                              double stretchTop, double stretchBot,
+                                              bool useTurkishFix, Action<string> log,
+                                              string material = "PLA", string speedProfile = "fast",
+                                              bool autoSpread = false, int perPlate = 40,
+                                              string fontSeq = null, double textHeightSeqMm = 7.0,
+                                              double charGapSeqMm = 0.0, double widthScaleSeq = 0.3,
+                                              double stretchSeq = 100.0)
+    {
+        output3mf = output3mf.Trim('"', '\'').TrimEnd('\\', '/');
+        string logPath = Path.Combine(GetAppDataDir(), "generator.log");
+        Action<string> fullLog = s =>
+        {
+            try { File.AppendAllText(logPath, s + "\r\n", Encoding.UTF8); } catch { }
+            if (log != null) log(s);
+            try { Console.WriteLine(s); } catch { }
+        };
+
+        try
+        {
+            if (string.IsNullOrEmpty(fontTop)) fontTop = "Trebuchet MS";
+            if (string.IsNullOrEmpty(fontBot)) fontBot = fontTop;
+            if (string.IsNullOrEmpty(fontSeq)) fontSeq = fontTop;
+            if (textHeightSeqMm > 9.00) textHeightSeqMm = 9.00;
+            double layerHeight = 0.12;
+            bool isPla = string.Equals(material, "PLA", StringComparison.OrdinalIgnoreCase);
+            string matType = isPla ? "PLA" : "PETG";
+            bool isFastSpeed = string.Equals(speedProfile, "fast", StringComparison.OrdinalIgnoreCase) || string.IsNullOrEmpty(speedProfile);
+
+            if (names == null || names.Count == 0) { fullLog("HATA: İsim listesi boş."); return false; }
+            if (perPlate < 1) perPlate = 40;
+            string[] fc = new string[4];
+            for (int fi = 0; fi < 4; fi++)
+                fc[fi] = (filamentHex != null && fi < filamentHex.Length && !string.IsNullOrEmpty(filamentHex[fi])) ? filamentHex[fi] : "#FFFFFF";
+
+            // Her isim x her renk çifti x adet kadar klips
+            List<int[]> instances = BuildBatchInstances(names.Count, combos);   // { isimIdx, çiftIdx }, renk çiftine göre gruplu
+            int count = instances.Count;
+            if (count == 0) { fullLog("HATA: Hiçbir renk çifti için adet girilmedi."); return false; }
+            int plateCount = (count + perPlate - 1) / perPlate;
+
+            fullLog("=== GÜVERCİN TOPLU KLİPS ÜRETİCİ BAŞLATILDI ===");
+            fullLog(string.Format("Tarih/Saat: {0}", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")));
+            fullLog(string.Format("Seçilen Malzeme (Filament): {0}", matType));
+            fullLog(string.Format("Filamentler: 1={0} | 2={1} | 3={2} | 4={3}", fc[0], fc[1], fc[2], fc[3]));
+            for (int n = 0; n < names.Count; n++)
+                fullLog(IsSeqEntry(names[n])
+                    ? string.Format("Numara {0}: '{1}' (tek yazı: gövde koyu, numara açık renk)", n + 1, names[n][0])
+                    : string.Format("İsim {0}: '{1}' / '{2}'", n + 1, names[n][0], names[n][1]));
+            for (int c = 0; c < combos.Count; c++)
+                fullLog(string.Format("Renk çifti {0}: koyu F{1} ({2}) alt gövde + üst yazı, açık F{3} ({4}) üst gövde + alt yazı, isim başına {5} adet",
+                    c + 1, combos[c][0], fc[combos[c][0] - 1], combos[c][1], fc[combos[c][1] - 1], combos[c][2]));
+            fullLog(string.Format("Toplam {0} klips, {1} tabla (tabla başına en fazla {2})", count, plateCount, perPlate));
+            fullLog(string.Format("Kabartma (Emboss): {0:F2} mm | İç Gömülme (Embed): {1:F2} mm", embossMm, embedMm));
+
+            if (!File.Exists(backup3mf))
+            {
+                fullLog("HATA: Şablon dosyası bulunamadı: " + backup3mf);
+                return false;
+            }
+
+            // 1. Orijinal halka modelini oku
+            fullLog("[1/5] Şablon dosyasından halka geometrisi okunuyor...");
+            string ringXml = "";
+            using (ZipArchive zip = ZipFile.OpenRead(backup3mf))
+            {
+                foreach (var e in zip.Entries)
+                {
+                    if (e.FullName.EndsWith(".model", StringComparison.OrdinalIgnoreCase) && !e.FullName.Contains("3dmodel.model"))
+                    {
+                        using (StreamReader sr = new StreamReader(e.Open(), Encoding.UTF8))
+                        {
+                            ringXml = sr.ReadToEnd();
+                        }
+                        break;
+                    }
+                }
+                if (string.IsNullOrEmpty(ringXml))
+                {
+                    var mEntry = zip.GetEntry("3D/3dmodel.model");
+                    if (mEntry != null)
+                    {
+                        using (StreamReader sr = new StreamReader(mEntry.Open(), Encoding.UTF8))
+                        {
+                            ringXml = sr.ReadToEnd();
+                        }
+                    }
+                }
+            }
+            if (string.IsNullOrEmpty(ringXml))
+            {
+                fullLog("HATA: Şablon zip içinde halka model XML verisi bulunamadı.");
+                return false;
+            }
+
+            // 2. Ham tek parça gövdeyi oku, dinamik Z ölçeğini hesapla ve Use-Surface örnekleyici kur
+            SolidMesh wholeRing = ParseMeshFromModelXml(ringXml);
+            List<string> twoColorPaint;
+            SolidMesh twoColorRing = BuildTwoColorBody(wholeRing, out twoColorPaint);
+            fullLog(string.Format("Çift renk gövde: alt yarı R1, üst yarı R2 (sınır tam orta yükseklikte, {0} -> {1} üçgen, gövde tek parça).",
+                wholeRing.Triangles.Count, twoColorRing.Triangles.Count));
+            double origMinZ = double.MaxValue, origMaxZ = double.MinValue;
+            foreach (var v in wholeRing.Vertices) { if (v.z < origMinZ) origMinZ = v.z; if (v.z > origMaxZ) origMaxZ = v.z; }
+            double origH = (origMaxZ > origMinZ) ? (origMaxZ - origMinZ) : 7.168;
+            double splitZ = (origMinZ + origMaxZ) * 0.5;
+            double dynZScale = 9.000 / origH;
+            double compTz = -0.616014361;
+            double seqPosZ = -(origMinZ + compTz) * dynZScale;
+
+            RingSurfaceSampler surfaceSampler = new RingSurfaceSampler(wholeRing, 0.0, -0.2754);
+
+            fullLog("[2/5] Tek parça 9 mm gövde korunuyor (bölme yok)...");
+            fullLog(string.Format("  -> Tek Parça Gövde: {0} köşe, {1} üçgen | Z=[{2:F3}, {3:F3}] (dynZScale={4:F6})", wholeRing.Vertices.Count, wholeRing.Triangles.Count, origMinZ, origMaxZ, dynZScale));
+
+            // 3. Her isim için üst/alt yazı (İsimli klips yerleşimi: 236° merkez, 258° güvenli yay)
+            double zHalfLocal = origH * 0.5;
+            double centerZTopLocal = splitZ + zHalfLocal * 0.5;
+            double centerZBotLocal = splitZ - zHalfLocal * 0.5;
+            fullLog(string.Format("[3/5] {0} isim için Use-Surface silindirik yazılar üretiliyor...", names.Count));
+            List<SolidMesh> topMeshes = new List<SolidMesh>();
+            List<SolidMesh> botMeshes = new List<SolidMesh>();
+            for (int n = 0; n < names.Count; n++)
+            {
+                if (IsSeqEntry(names[n]))
+                {
+                    // Sıralı klips yerleşimi: tek yazı, tam orta yükseklikte
+                    LastTextFitNote = null;
+                    SolidMesh ts = GenerateDistributedCylindricalText(names[n][0], fontSeq, textHeightSeqMm, splitZ, 236.0, embedMm, embossMm, dynZScale, charGapSeqMm, 0, widthScaleSeq, 258.0, stretchSeq / 100.0, false, 0.0, 0.0, true, surfaceSampler, -1.0, autoSpread);
+                    if (LastTextFitNote != null) fullLog(LastTextFitNote);
+                    topMeshes.Add(ts);
+                    botMeshes.Add(null);
+                    fullLog(string.Format("  -> [{0}/{1}] Numara '{2}' ({3} üçgen)", n + 1, names.Count, names[n][0], ts.Triangles.Count));
+                    continue;
+                }
+                LastTextFitNote = null;
+                SolidMesh tt = GenerateDistributedCylindricalText(names[n][0], fontTop, textHeightTopMm, centerZTopLocal, 236.0, embedMm, embossMm, dynZScale, charGapTopMm, 0, widthScaleTop, 258.0, stretchTop / 100.0, false, 0.0, 0.0, useTurkishFix, surfaceSampler, -1.0, autoSpread);
+                if (LastTextFitNote != null) fullLog(LastTextFitNote);
+                LastTextFitNote = null;
+                SolidMesh tb = GenerateDistributedCylindricalText(names[n][1], fontBot, textHeightBotMm, centerZBotLocal, 236.0, embedMm, embossMm, dynZScale, charGapBotMm, 0, widthScaleBot, 258.0, stretchBot / 100.0, false, 0.0, 0.0, useTurkishFix, surfaceSampler, -1.0, autoSpread);
+                if (LastTextFitNote != null) fullLog(LastTextFitNote);
+                topMeshes.Add(tt);
+                botMeshes.Add(tb);
+                fullLog(string.Format("  -> [{0}/{1}] '{2}' ({3} üçgen) / '{4}' ({5} üçgen)", n + 1, names.Count, names[n][0], tt.Triangles.Count, names[n][1], tb.Triangles.Count));
+            }
+
+            // Çift renk gövde: alt yarı parçanın extruder'ı (koyu), üst yarı açık renge boyanır.
+            // Boyama kodu açık renge göre değiştiği için her açık filament için ayrı gövde nesnesi yazılır.
+            List<int> lightExts = new List<int>();
+            bool anySeq = false;
+            foreach (var inst in instances)
+            {
+                if (IsSeqEntry(names[inst[0]])) { anySeq = true; continue; }
+                int le = combos[inst[1]][1];
+                if (!lightExts.Contains(le)) lightExts.Add(le);
+            }
+
+            // Nesne numaraları: 1..L gövdeler, sonra isim başına üst/alt yazı, sonra klips montajları
+            Dictionary<int, int> ringObjForLight = new Dictionary<int, int>();
+            int nextId = 1;
+            foreach (int le in lightExts) ringObjForLight[le] = nextId++;
+            int plainRingObj = anySeq ? nextId++ : 0;   // numara klipsleri: boyasız tek renk gövde
+            int[] topObj = new int[names.Count], botObj = new int[names.Count];
+            for (int n = 0; n < names.Count; n++) { topObj[n] = nextId++; botObj[n] = IsSeqEntry(names[n]) ? 0 : nextId++; }
+            int firstAssId = nextId;
+
+            // 4. Geçici çalışma dizini oluştur
+            fullLog("[4/5] Çok tablalı toplu 3MF proje yapısı inşa ediliyor...");
+            string tempDir = Path.Combine(Path.GetTempPath(), "pigeon_batch_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(tempDir);
+            using (ZipArchive zip = ZipFile.OpenRead(backup3mf))
+            {
+                foreach (var e in zip.Entries)
+                {
+                    if (string.IsNullOrEmpty(e.Name) || e.FullName.EndsWith("/") || e.FullName.EndsWith(@"\"))
+                        continue;
+                    if (e.FullName.StartsWith("3D/Objects/", StringComparison.OrdinalIgnoreCase) ||
+                        e.FullName.StartsWith("3D/_rels/", StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    string destPath = Path.Combine(tempDir, e.FullName.Replace('/', Path.DirectorySeparatorChar));
+                    Directory.CreateDirectory(Path.GetDirectoryName(destPath));
+                    e.ExtractToFile(destPath, true);
+                }
+            }
+
+            // Yerleşim: tabla başına ızgara; tablalar OrcaSlicer düzeninde (yan yana, sonra alt satır)
+            const double plateStride = 350.0;
+            int plateCols = (int)Math.Ceiling(Math.Sqrt(plateCount));
+            double[] posX, posY;
+            int[] plateOf;
+            ComputeBatchLayout(count, perPlate, out posX, out posY, out plateOf);
+            for (int i = 0; i < count; i++)
+            {
+                int pl = plateOf[i];
+                posX[i] += (pl % plateCols) * plateStride;
+                posY[i] -= (pl / plateCols) * plateStride;
+            }
+            const string itemRot = "0.8209808 0.5709558 0 -0.5709558 0.8209808 0 0 0";
+            string compTr = string.Format(CultureInfo.InvariantCulture, "1 0 0 0 1 0 0 0 1 -0.237974882 -0.0705842972 {0:F9}", compTz);
+
+            // 5. 3D/3dmodel.model
+            string model3DPath = Path.Combine(tempDir, "3D", "3dmodel.model");
+            using (StreamWriter sw = new StreamWriter(model3DPath, false, Encoding.UTF8))
+            {
+                sw.WriteLine("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+                sw.WriteLine("<model unit=\"millimeter\" xml:lang=\"en-US\" xmlns=\"http://schemas.microsoft.com/3dmanufacturing/core/2015/02\">");
+                sw.WriteLine(" <metadata name=\"Application\">Snapmaker_Orca-1.10.1</metadata>");
+                sw.WriteLine(" <metadata name=\"Snapmaker_Orca:3mfVersion\">1</metadata>");
+                sw.WriteLine(" <resources>");
+
+                foreach (int le in lightExts)
+                {
+                    string code = PaintCodeForExtruder(le);
+                    List<string> paint = new List<string>(twoColorPaint.Count);
+                    foreach (string ps in twoColorPaint) paint.Add(string.IsNullOrEmpty(ps) ? "" : code);
+                    WriteRingObject(sw, ringObjForLight[le], twoColorRing, paint);
+                }
+                if (anySeq) WriteRingObject(sw, plainRingObj, wholeRing, null);
+                for (int n = 0; n < names.Count; n++)
+                {
+                    WriteRingObject(sw, topObj[n], topMeshes[n], null);
+                    if (botObj[n] != 0) WriteRingObject(sw, botObj[n], botMeshes[n], null);
+                }
+                for (int i = 0; i < count; i++)
+                {
+                    int n = instances[i][0];
+                    int le = combos[instances[i][1]][1];
+                    bool seq = IsSeqEntry(names[n]);
+                    sw.WriteLine(string.Format("  <object id=\"{0}\" type=\"model\">", firstAssId + i));
+                    sw.WriteLine("   <components>");
+                    sw.WriteLine(string.Format("    <component objectid=\"{0}\" transform=\"{1}\"/>", seq ? plainRingObj : ringObjForLight[le], compTr));
+                    sw.WriteLine(string.Format("    <component objectid=\"{0}\" transform=\"{1}\"/>", topObj[n], compTr));
+                    if (!seq) sw.WriteLine(string.Format("    <component objectid=\"{0}\" transform=\"{1}\"/>", botObj[n], compTr));
+                    sw.WriteLine("   </components>");
+                    sw.WriteLine("  </object>");
+                }
+                sw.WriteLine(" </resources>");
+                sw.WriteLine(" <build>");
+                for (int i = 0; i < count; i++)
+                    sw.WriteLine(string.Format(CultureInfo.InvariantCulture,
+                        "  <item objectid=\"{0}\" transform=\"{1} {2:F6} {3:F6} {4:F6} {5:F6}\" printable=\"1\"/>",
+                        firstAssId + i, itemRot, dynZScale, posX[i], posY[i], seqPosZ));
+                sw.WriteLine(" </build>");
+                sw.WriteLine("</model>");
+            }
+
+            // 6. Metadata/model_settings.config: parça extruder'ları renk çiftine göre
+            string modelSettingsPath = Path.Combine(tempDir, "Metadata", "model_settings.config");
+            using (StreamWriter sw = new StreamWriter(modelSettingsPath, false, Encoding.UTF8))
+            {
+                sw.WriteLine("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+                sw.WriteLine("<config>");
+                for (int i = 0; i < count; i++)
+                {
+                    int n = instances[i][0];
+                    int[] cb = combos[instances[i][1]];
+                    int dark = cb[0], light = cb[1];
+                    string name = string.Format("Klips_{0}_F{1}-F{2}_{3}", MakeSafeFileName(names[n][0]), dark, light, i + 1);
+                    sw.WriteLine(string.Format("  <object id=\"{0}\">", firstAssId + i));
+                    sw.WriteLine(string.Format("    <metadata key=\"name\" value=\"{0}\"/>", System.Security.SecurityElement.Escape(name)));
+                    if (IsSeqEntry(names[n]))
+                    {
+                        // Numara klipsi: tek renk gövde koyu, numara açık renk
+                        sw.WriteLine(string.Format("    <part id=\"{0}\" subtype=\"normal_part\">", plainRingObj));
+                        sw.WriteLine("      <metadata key=\"name\" value=\"ring_whole\"/>");
+                        sw.WriteLine(string.Format("      <metadata key=\"extruder\" value=\"{0}\"/>", dark));
+                        sw.WriteLine("    </part>");
+                        sw.WriteLine(string.Format("    <part id=\"{0}\" subtype=\"normal_part\">", topObj[n]));
+                        sw.WriteLine("      <metadata key=\"name\" value=\"text_seq\"/>");
+                        sw.WriteLine(string.Format("      <metadata key=\"extruder\" value=\"{0}\"/>", light));
+                        sw.WriteLine("    </part>");
+                        sw.WriteLine("  </object>");
+                        continue;
+                    }
+                    sw.WriteLine(string.Format("    <part id=\"{0}\" subtype=\"normal_part\">", ringObjForLight[light]));
+                    sw.WriteLine("      <metadata key=\"name\" value=\"ring_cift_renk\"/>");
+                    sw.WriteLine(string.Format("      <metadata key=\"extruder\" value=\"{0}\"/>", dark));
+                    sw.WriteLine("    </part>");
+                    sw.WriteLine(string.Format("    <part id=\"{0}\" subtype=\"normal_part\">", topObj[n]));
+                    sw.WriteLine("      <metadata key=\"name\" value=\"text_top\"/>");
+                    sw.WriteLine(string.Format("      <metadata key=\"extruder\" value=\"{0}\"/>", dark));
+                    sw.WriteLine("    </part>");
+                    sw.WriteLine(string.Format("    <part id=\"{0}\" subtype=\"normal_part\">", botObj[n]));
+                    sw.WriteLine("      <metadata key=\"name\" value=\"text_bot\"/>");
+                    sw.WriteLine(string.Format("      <metadata key=\"extruder\" value=\"{0}\"/>", light));
+                    sw.WriteLine("    </part>");
+                    sw.WriteLine("  </object>");
+                }
+                for (int p = 0; p < plateCount; p++)
+                {
+                    sw.WriteLine("  <plate>");
+                    sw.WriteLine(string.Format("    <metadata key=\"plater_id\" value=\"{0}\"/>", p + 1));
+                    sw.WriteLine(string.Format("    <metadata key=\"plater_name\" value=\"{0}-Toplu\"/>", p + 1));
+                    sw.WriteLine("    <metadata key=\"locked\" value=\"false\"/>");
+                    sw.WriteLine("    <metadata key=\"filament_maps\" value=\"1 2 3 4\"/>");
+                    sw.WriteLine("    <metadata key=\"thumbnail_file\" value=\"Metadata/plate_1.png\"/>");
+                    sw.WriteLine("    <metadata key=\"top_file\" value=\"Metadata/top_1.png\"/>");
+                    sw.WriteLine("    <metadata key=\"pick_file\" value=\"Metadata/pick_1.png\"/>");
+                    for (int i = 0; i < count; i++)
+                    {
+                        if (plateOf[i] != p) continue;
+                        sw.WriteLine("    <model_instance>");
+                        sw.WriteLine(string.Format("      <metadata key=\"object_id\" value=\"{0}\"/>", firstAssId + i));
+                        sw.WriteLine("      <metadata key=\"instance_id\" value=\"0\"/>");
+                        sw.WriteLine(string.Format("      <metadata key=\"identify_id\" value=\"{0}\"/>", 1000 + firstAssId + i));
+                        sw.WriteLine("    </model_instance>");
+                    }
+                    sw.WriteLine("  </plate>");
+                }
+                sw.WriteLine("  <assemble>");
+                for (int i = 0; i < count; i++)
+                    sw.WriteLine(string.Format(CultureInfo.InvariantCulture,
+                        "   <assemble_item object_id=\"{0}\" instance_id=\"0\" transform=\"{1} {2:F6} {3:F6} {4:F6} {5:F6}\" offset=\"0 0 0.6118\" />",
+                        firstAssId + i, itemRot, dynZScale, posX[i], posY[i], seqPosZ));
+                sw.WriteLine("  </assemble>");
+                sw.WriteLine("</config>");
+            }
+
+            // 7. Slicer ve Filament Ayarları
+            fullLog(string.Format("[5/5] Dilimleme parametreleri ({0}) ve 3 renkli {1} profili yapılandırılıyor...", isFastSpeed ? "HIZLI BASKI" : "YAVAŞ BASKI", matType));
+            string filProfileName = string.Format("Generic {0} (Klips)({1})", matType, Path.GetFileName(output3mf));
+            string inheritsFil = isPla ? "Generic PLA" : "Generic PETG";
+
+            string sOuterWallSpeed = isFastSpeed ? "80" : "30";
+            string sInnerWallSpeed = isFastSpeed ? "300" : "45";
+            string sSmallPerimeterSpeed = isFastSpeed ? "50" : "20";
+            string sSparseInfillSpeed = isFastSpeed ? "270" : "50";
+            string sTopSurfaceSpeed = isFastSpeed ? "200" : "30";
+            string sInitialLayerSpeed = isFastSpeed ? "50" : "18";
+            string sInitialLayerInfillSpeed = isFastSpeed ? "105" : "25";
+            string sTravelSpeed = isFastSpeed ? "500" : "250";
+            string sInitialLayerTravelSpeed = isFastSpeed ? "500" : "150";
+
+            string nozzleTemp = isPla ? "205" : "240";
+            string nozzleInitialTemp = isPla ? "215" : "235";
+            string rangeHigh = isPla ? "230" : "250";
+            string rangeLow = isPla ? "190" : "220";
+            string bedTemp = isPla ? (isFastSpeed ? "65" : "60") : "75";
+            string bedInitialTemp = isPla ? "65" : "80";
+            string retLength = "1.0";
+            string retSpeed = "45";
+            string deretSpeed = "40";
+            string wipeDist = "3";
+            string fanMin = isPla ? "100" : "10";
+            string fanMax = isPla ? "100" : "60";
+            string flowRatio = "0.98";
+            string maxVolSpeed = isPla ? "16" : "12";
+
+            string layerHeightStr = layerHeight.ToString("F2", CultureInfo.InvariantCulture);
+            string procInherits = "fdm_process_U1_" + layerHeightStr;
+            string settingIdStr = (Math.Abs(layerHeight - 0.16) < 0.01) ? "GP107" : "GP004";
+            string btmShell = (layerHeight >= 0.15) ? "4" : "5";
+            string topShell = (Math.Abs(layerHeight - 0.16) < 0.01) ? "6" : "5";
+            string topThick = (layerHeight >= 0.15) ? "1.0" : "0.6";
+            string procName = isFastSpeed 
+                ? string.Format("{0}mm Standard @Snapmaker U1 (0.4 nozzle)", layerHeightStr) 
+                : string.Format("{0}mm Color Mixing @Snapmaker U1 (0.4 nozzle)", layerHeightStr);
+
+            Action<string> updateProcess = path =>
+            {
+                if (!File.Exists(path)) return;
+                string json = File.ReadAllText(path, Encoding.UTF8);
+                json = SetJsonVal(json, "name", procName);
+                json = SetJsonVal(json, "print_settings_id", procName);
+                json = SetJsonArray(json, "compatible_printers", "Snapmaker U1 (0.4 nozzle)");
+                json = SetJsonVal(json, "from", "project");
+                json = SetJsonVal(json, "inherits", procInherits);
+                json = SetJsonVal(json, "layer_height", layerHeightStr);
+                json = SetJsonVal(json, "initial_layer_print_height", "0.20");
+                json = SetJsonVal(json, "bottom_shell_layers", btmShell);
+                json = SetJsonVal(json, "top_shell_layers", topShell);
+                json = SetJsonVal(json, "top_shell_thickness", topThick);
+                json = SetJsonVal(json, "support_top_z_distance", layerHeightStr);
+                json = SetJsonVal(json, "support_bottom_z_distance", layerHeightStr);
+                json = SetJsonVal(json, "wall_generator", "classic");
+                json = SetJsonVal(json, "detect_thin_wall", "0");
+                json = SetJsonVal(json, "enable_arc_fitting", "0");
+                json = SetJsonVal(json, "line_width", "0.42");
+                json = SetJsonVal(json, "outer_wall_line_width", "0.42");
+                json = SetJsonVal(json, "inner_wall_line_width", "0.45");
+                json = SetJsonVal(json, "initial_layer_line_width", "0.50");
+                json = SetJsonVal(json, "wall_loops", "2");
+                json = SetJsonVal(json, "sparse_infill_density", "100%");
+                json = SetJsonVal(json, "sparse_infill_pattern", "rectilinear");
+                json = SetJsonVal(json, "outer_wall_speed", sOuterWallSpeed);
+                json = SetJsonVal(json, "inner_wall_speed", sInnerWallSpeed);
+                json = SetJsonVal(json, "small_perimeter_speed", sSmallPerimeterSpeed);
+                json = SetJsonVal(json, "sparse_infill_speed", sSparseInfillSpeed);
+                json = SetJsonVal(json, "top_surface_speed", sTopSurfaceSpeed);
+                json = SetJsonVal(json, "initial_layer_speed", sInitialLayerSpeed);
+                json = SetJsonVal(json, "initial_layer_infill_speed", sInitialLayerInfillSpeed);
+                json = SetJsonVal(json, "travel_speed", sTravelSpeed);
+                json = SetJsonVal(json, "initial_layer_travel_speed", sInitialLayerTravelSpeed);
+                json = SetJsonVal(json, "reduce_infill_retraction", "0");
+                json = SetJsonVal(json, "seam_position", "back");
+                json = SetJsonVal(json, "wipe_on_loops", "1");
+                json = SetJsonVal(json, "role_based_wipe_speed", "1");
+
+                // Auto brim (Kullanıcı talebi: outer 2mm / 0.14 gap)
+                json = SetJsonVal(json, "brim_type", "outer_only");
+                json = SetJsonVal(json, "brim_width", "2");
+                json = SetJsonVal(json, "brim_object_gap", "0.14");
+                json = SetJsonVal(json, "enable_auto_brim", "0");
+                json = SetJsonVal(json, "elefant_foot_compensation", "0");
+                if (json.Contains("brim_object_gap;brim_width;"))
+                {
+                    json = json.Replace("brim_object_gap;brim_width;", "brim_object_gap;brim_type;brim_width;");
+                }
+
+                // Prime tower (Resmi Snapmaker U1 çoklu kafa: kaburgalı 30mm kule, 5mm brim, %120 aralık, 27mm3 prime)
+                json = ApplyU1PrimeTowerProcessSettings(json, true);
+
+                // İpliklenme ve duvar aşma önleme (Dış hatlardan kestirme geçişi engeller)
+                json = SetJsonVal(json, "reduce_crossing_wall", "1");
+                json = SetJsonVal(json, "max_travel_detour_distance", "30");
+                File.WriteAllText(path, json, Encoding.UTF8);
+            };
+
+            Action<string> updateConfig = path =>
+            {
+                if (!File.Exists(path)) return;
+                string json = File.ReadAllText(path, Encoding.UTF8);
+                json = SetJsonVal(json, "print_settings_id", procName);
+                json = SetJsonVal(json, "name", procName);
+                json = SetJsonVal(json, "setting_id", settingIdStr);
+                json = SetJsonVal(json, "inherits", procInherits);
+                json = SetJsonVal(json, "layer_height", layerHeightStr);
+                json = SetJsonVal(json, "initial_layer_print_height", "0.20");
+                json = SetJsonVal(json, "bottom_shell_layers", btmShell);
+                json = SetJsonVal(json, "top_shell_layers", topShell);
+                json = SetJsonVal(json, "top_shell_thickness", topThick);
+                json = SetJsonVal(json, "support_top_z_distance", layerHeightStr);
+                json = SetJsonVal(json, "support_bottom_z_distance", layerHeightStr);
+                json = SetJsonVal(json, "wall_generator", "classic");
+                json = SetJsonVal(json, "detect_thin_wall", "0");
+                json = SetJsonVal(json, "enable_arc_fitting", "0");
+                json = SetJsonVal(json, "line_width", "0.42");
+                json = SetJsonVal(json, "outer_wall_line_width", "0.42");
+                json = SetJsonVal(json, "inner_wall_line_width", "0.45");
+                json = SetJsonVal(json, "initial_layer_line_width", "0.50");
+                json = SetJsonVal(json, "wall_loops", "2");
+                json = SetJsonVal(json, "sparse_infill_density", "100%");
+                json = SetJsonVal(json, "sparse_infill_pattern", "rectilinear");
+                json = SetJsonVal(json, "outer_wall_speed", sOuterWallSpeed);
+                json = SetJsonVal(json, "inner_wall_speed", sInnerWallSpeed);
+                json = SetJsonVal(json, "small_perimeter_speed", sSmallPerimeterSpeed);
+                json = SetJsonVal(json, "sparse_infill_speed", sSparseInfillSpeed);
+                json = SetJsonVal(json, "top_surface_speed", sTopSurfaceSpeed);
+                json = SetJsonVal(json, "initial_layer_speed", sInitialLayerSpeed);
+                json = SetJsonVal(json, "initial_layer_infill_speed", sInitialLayerInfillSpeed);
+                json = SetJsonVal(json, "travel_speed", sTravelSpeed);
+                json = SetJsonVal(json, "initial_layer_travel_speed", sInitialLayerTravelSpeed);
+                json = SetJsonVal(json, "reduce_infill_retraction", "0");
+                json = SetJsonVal(json, "seam_position", "back");
+                json = SetJsonVal(json, "wipe_on_loops", "1");
+                json = SetJsonVal(json, "role_based_wipe_speed", "1");
+
+                // Auto brim (Kullanıcı talebi: outer 2mm / 0.14 gap)
+                json = SetJsonVal(json, "brim_type", "outer_only");
+                json = SetJsonVal(json, "brim_width", "2");
+                json = SetJsonVal(json, "brim_object_gap", "0.14");
+                json = SetJsonVal(json, "enable_auto_brim", "0");
+                json = SetJsonVal(json, "elefant_foot_compensation", "0");
+
+                // Prime tower (Resmi Snapmaker U1 çoklu kafa kulesi + çakışmasız yatak konumu)
+                json = ApplyU1PrimeTowerProcessSettings(json, false);
+                json = ApplyU1PrimeTowerMachineSettings(json);
+                json = ApplyU1PrimeTowerFilamentSettings(json, 4, isPla);
+                json = SetJsonArray(json, "wipe_tower_x", "25", "25");
+                json = SetJsonArray(json, "wipe_tower_y", "195", "195");
+
+                // İpliklenme ve duvar aşma önleme
+                json = SetJsonVal(json, "reduce_crossing_wall", "1");
+                json = SetJsonVal(json, "max_travel_detour_distance", "30");
+
+                // TAM 3 Renk: 1=Renk1, 2=Renk2, 3=Renk3 (Kesinlikle 4. renk / sabit siyah YOK)
+                json = SetJsonArray(json, "filament_colour", fc[0], fc[1], fc[2], fc[3]);
+                json = SetJsonArray(json, "filament_type", matType, matType, matType, matType);
+                json = SetJsonArray(json, "filament_settings_id", filProfileName, filProfileName, filProfileName, filProfileName);
+                json = SetJsonArray(json, "nozzle_temperature", nozzleTemp, nozzleTemp, nozzleTemp, nozzleTemp);
+                json = SetJsonArray(json, "nozzle_temperature_initial_layer", nozzleInitialTemp, nozzleInitialTemp, nozzleInitialTemp, nozzleInitialTemp);
+                json = SetJsonArray(json, "nozzle_temperature_range_high", rangeHigh, rangeHigh, rangeHigh, rangeHigh);
+                json = SetJsonArray(json, "nozzle_temperature_range_low", rangeLow, rangeLow, rangeLow, rangeLow);
+                json = SetJsonArray(json, "hot_plate_temp", bedTemp, bedTemp, bedTemp, bedTemp);
+                json = SetJsonArray(json, "hot_plate_temp_initial_layer", bedInitialTemp, bedInitialTemp, bedInitialTemp, bedInitialTemp);
+                json = SetJsonArray(json, "textured_plate_temp", bedTemp, bedTemp, bedTemp, bedTemp);
+                json = SetJsonArray(json, "textured_plate_temp_initial_layer", bedInitialTemp, bedInitialTemp, bedInitialTemp, bedInitialTemp);
+                json = SetJsonArray(json, "filament_max_volumetric_speed", maxVolSpeed, maxVolSpeed, maxVolSpeed, maxVolSpeed);
+                json = SetJsonArray(json, "fan_min_speed", fanMin, fanMin, fanMin, fanMin);
+                json = SetJsonArray(json, "fan_max_speed", fanMax, fanMax, fanMax, fanMax);
+                json = SetJsonArray(json, "filament_flow_ratio", flowRatio, flowRatio, flowRatio, flowRatio);
+                json = SetJsonArray(json, "filament_retraction_length", retLength, retLength, retLength, retLength);
+                json = SetJsonArray(json, "filament_retraction_speed", retSpeed, retSpeed, retSpeed, retSpeed);
+                json = SetJsonArray(json, "filament_deretraction_speed", deretSpeed, deretSpeed, deretSpeed, deretSpeed);
+                json = SetJsonArray(json, "filament_retract_when_changing_layer", "1", "1", "1", "1");
+                json = SetJsonArray(json, "filament_wipe", "1", "1", "1", "1");
+                json = SetJsonArray(json, "filament_wipe_distance", wipeDist, wipeDist, wipeDist, wipeDist);
+                json = SetJsonArray(json, "retraction_length", retLength, retLength, retLength, retLength);
+                json = SetJsonArray(json, "retraction_speed", retSpeed, retSpeed, retSpeed, retSpeed);
+                json = SetJsonArray(json, "deretraction_speed", deretSpeed, deretSpeed, deretSpeed, deretSpeed);
+                json = SetJsonArray(json, "retract_before_wipe", "70%", "70%", "70%", "70%");
+                json = SetJsonArray(json, "wipe", "1", "1", "1", "1");
+                json = SetJsonArray(json, "wipe_distance", wipeDist, wipeDist, wipeDist, wipeDist);
+                json = SetJsonArray(json, "z_hop", "0", "0", "0", "0");
+
+                // Renk Geçiş Hacimleri (3x3 Flush & Purge Matrisi - Tam 3 Renk İçin Optimize Edildi)
+                json = SetJsonArray(json, "flush_volumes_matrix",
+                    "0",   "280", "280", "280",
+                    "280", "0",   "280", "280",
+                    "280", "280", "0",   "280",
+                    "280", "280", "280", "0");
+                json = SetJsonArray(json, "flush_volumes_vector", "280", "280", "280", "280");
+                json = SetJsonArray(json, "wiping_volumes_extruders", "280", "280", "280", "280");
+                json = SetJsonVal(json, "flush_multiplier", "1");
+
+                File.WriteAllText(path, json, Encoding.UTF8);
+            };
+
+            Action<string> updateFilament = path =>
+            {
+                if (!File.Exists(path)) return;
+                string json = File.ReadAllText(path, Encoding.UTF8);
+                json = SetJsonArray(json, "filament_settings_id", filProfileName);
+                json = SetJsonVal(json, "name", filProfileName);
+                json = SetJsonVal(json, "from", "project");
+                json = SetJsonVal(json, "inherits", inheritsFil);
+                json = SetJsonArray(json, "filament_type", matType);
+                json = SetJsonArray(json, "filament_vendor", "Generic");
+                json = SetJsonArray(json, "nozzle_temperature", nozzleTemp);
+                json = SetJsonArray(json, "nozzle_temperature_initial_layer", nozzleInitialTemp);
+                json = SetJsonArray(json, "nozzle_temperature_range_high", rangeHigh);
+                json = SetJsonArray(json, "nozzle_temperature_range_low", rangeLow);
+                json = SetJsonArray(json, "hot_plate_temp", bedTemp);
+                json = SetJsonArray(json, "hot_plate_temp_initial_layer", bedInitialTemp);
+                json = SetJsonArray(json, "textured_plate_temp", bedTemp);
+                json = SetJsonArray(json, "textured_plate_temp_initial_layer", bedInitialTemp);
+                json = SetJsonArray(json, "filament_max_volumetric_speed", maxVolSpeed);
+                json = SetJsonArray(json, "fan_min_speed", fanMin);
+                json = SetJsonArray(json, "fan_max_speed", fanMax);
+                json = SetJsonArray(json, "filament_flow_ratio", flowRatio);
+                json = SetJsonArray(json, "filament_retraction_length", retLength);
+                json = SetJsonArray(json, "filament_retraction_speed", retSpeed);
+                json = SetJsonArray(json, "filament_deretraction_speed", deretSpeed);
+                json = SetJsonArray(json, "filament_retract_when_changing_layer", "1");
+                json = SetJsonArray(json, "filament_wipe", "1");
+                json = SetJsonArray(json, "filament_wipe_distance", wipeDist);
+                json = SetJsonArray(json, "filament_retract_before_wipe", "70%");
+                json = SetJsonArray(json, "filament_z_hop", "0");
+                json = ApplyU1PrimeTowerFilamentSettings(json, 1, isPla);
+                File.WriteAllText(path, json, Encoding.UTF8);
+            };
+
+            Action<string> updateMachine = path =>
+            {
+                if (!File.Exists(path)) return;
+                string json = File.ReadAllText(path, Encoding.UTF8);
+                json = SetJsonVal(json, "name", "Snapmaker U1 (0.4 nozzle)");
+                json = SetJsonVal(json, "printer_model", "Snapmaker U1");
+                json = SetJsonVal(json, "printer_settings_id", "Snapmaker U1 (0.4 nozzle)");
+                json = SetJsonVal(json, "from", "project");
+                json = SetJsonVal(json, "default_print_profile", procName);
+                json = SetJsonArray(json, "compatible_printers", "Snapmaker U1 (0.4 nozzle)");
+                json = SetJsonArray(json, "default_filament_profile", filProfileName, filProfileName, filProfileName, filProfileName);
+                json = SetJsonArray(json, "retraction_length", retLength, retLength, retLength, retLength);
+                json = SetJsonArray(json, "retraction_speed", retSpeed, retSpeed, retSpeed, retSpeed);
+                json = SetJsonArray(json, "deretraction_speed", deretSpeed, deretSpeed, deretSpeed, deretSpeed);
+                json = SetJsonArray(json, "retract_before_wipe", "70%", "70%", "70%", "70%");
+                json = SetJsonArray(json, "wipe", "1", "1", "1", "1");
+                json = SetJsonArray(json, "wipe_distance", wipeDist, wipeDist, wipeDist, wipeDist);
+                json = SetJsonArray(json, "z_hop", "0", "0", "0", "0");
+                json = SetJsonArray(json, "retract_when_changing_layer", "1", "1", "1", "1");
+                json = ApplyU1PrimeTowerMachineSettings(json);
+                File.WriteAllText(path, json, Encoding.UTF8);
+            };
+
+            updateProcess(Path.Combine(tempDir, "Metadata", "process_settings_1.config"));
+            updateConfig(Path.Combine(tempDir, "Metadata", "project_settings.config"));
+            updateFilament(Path.Combine(tempDir, "Metadata", "filament_settings_1.config"));
+            updateFilament(Path.Combine(tempDir, "Metadata", "filament_settings_2.config"));
+
+            // 3. filament config oluştur (Varsa 1'den kopyala ve güncelle)
+            string fil1Path = Path.Combine(tempDir, "Metadata", "filament_settings_1.config");
+            for (int fi = 3; fi <= 4; fi++)
+            {
+                string filNPath = Path.Combine(tempDir, "Metadata", string.Format("filament_settings_{0}.config", fi));
+                if (File.Exists(fil1Path)) File.Copy(fil1Path, filNPath, true);
+                updateFilament(filNPath);
+            }
+            updateMachine(Path.Combine(tempDir, "Metadata", "machine_settings_1.config"));
+
+            // 4..16 gereksiz filamentleri sil (Projeyi TAM 3 RENK ile sınırla)
+            for (int fi = 5; fi <= 16; fi++)
+            {
+                string extraFil = Path.Combine(tempDir, "Metadata", string.Format("filament_settings_{0}.config", fi));
+                if (File.Exists(extraFil)) File.Delete(extraFil);
+            }
+
+            // JSON Metadata kaydet
+            RingConfig seqCfg = new RingConfig();
+            seqCfg.Mode = GeneratorMode.IsimliKlips;
+            seqCfg.TopText = names[0][0];
+            seqCfg.BotText = names[0][1];
+            seqCfg.FontTop = fontTop;
+            seqCfg.FontBot = fontBot;
+            seqCfg.TextHeightTopMm = textHeightTopMm;
+            seqCfg.TextHeightBotMm = textHeightBotMm;
+            seqCfg.CharGapTopMm = charGapTopMm;
+            seqCfg.CharGapBotMm = charGapBotMm;
+            seqCfg.WidthScaleTop = widthScaleTop;
+            seqCfg.WidthScaleBot = widthScaleBot;
+            seqCfg.StretchTop = stretchTop;
+            seqCfg.StretchBot = stretchBot;
+            seqCfg.EmbossMm = embossMm;
+            seqCfg.EmbedMm = embedMm;
+            seqCfg.OverhangChamferDeg = DefaultOverhangChamferDeg;
+            seqCfg.Material = material;
+            seqCfg.Color1Hex = fc[0];
+            seqCfg.Color2Hex = fc[1];
+            seqCfg.CreatedDate = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+
+            string configJsonPath = Path.Combine(tempDir, "Metadata", "pigeon_ring_config.json");
+            File.WriteAllText(configJsonPath, seqCfg.ToJson(), Encoding.UTF8);
+
+            // Ensure _rels/.rels
+            string rootRelsPath = Path.Combine(tempDir, "_rels", ".rels");
+            Directory.CreateDirectory(Path.GetDirectoryName(rootRelsPath));
+            using (StreamWriter sw = new StreamWriter(rootRelsPath, false, Encoding.UTF8))
+            {
+                sw.WriteLine("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+                sw.WriteLine("<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">");
+                sw.WriteLine(" <Relationship Target=\"/3D/3dmodel.model\" Id=\"rel-1\" Type=\"http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel\"/>");
+                sw.WriteLine("</Relationships>");
+            }
+
+            // Özel font göm
+            try
+            {
+                string metaFontsDir = Path.Combine(tempDir, "Metadata", "Fonts");
+                string fontFile = FontManager.GetFontFilePath(fontTop);
+                if (!string.IsNullOrEmpty(fontFile) && File.Exists(fontFile))
+                {
+                    Directory.CreateDirectory(metaFontsDir);
+                    string dest = Path.Combine(metaFontsDir, Path.GetFileName(fontFile));
+                    File.Copy(fontFile, dest, true);
+                    fullLog(string.Format("  -> Özel font 3MF içine gömüldü: {0}", Path.GetFileName(fontFile)));
+                }
+            }
+            catch { }
+
+            // ZIP paketi oluştur
+            CleanResidualMetadata(tempDir);
+
+            if (File.Exists(output3mf)) File.Delete(output3mf);
+            CreateZipArchive(tempDir, output3mf);
+
+            // Bilgi raporu kaydet
+            try
+            {
+                string infoPath = Path.Combine(Path.GetDirectoryName(output3mf), Path.GetFileNameWithoutExtension(output3mf) + "_bilgi.txt");
+                StringBuilder rep = new StringBuilder();
+                rep.AppendLine(seqCfg.ToReportText(Path.GetFileName(output3mf)));
+                rep.AppendLine("TOPLU ÜRETİM");
+                rep.AppendLine(string.Format("Filamentler: F1={0}  F2={1}  F3={2}  F4={3}", fc[0], fc[1], fc[2], fc[3]));
+                foreach (var nm in names)
+                    rep.AppendLine(IsSeqEntry(nm) ? string.Format("Numara: {0}", nm[0]) : string.Format("İsim: {0} / {1}", nm[0], nm[1]));
+                foreach (var cb in combos)
+                    rep.AppendLine(string.Format("Renk çifti: koyu F{0} + açık F{1}, isim başına {2} adet", cb[0], cb[1], cb[2]));
+                rep.AppendLine(string.Format("Toplam: {0} klips, {1} tabla", count, plateCount));
+                File.WriteAllText(infoPath, rep.ToString(), Encoding.UTF8);
+                fullLog(string.Format("Ayar ve Bilgi Raporu Kaydedildi: {0}", Path.GetFileName(infoPath)));
+            }
+            catch (Exception exInfo)
+            {
+                fullLog("Bilgi raporu kaydedilemedi: " + exInfo.Message);
+            }
+
+            try { Directory.Delete(tempDir, true); } catch { }
+
+            fullLog(string.Format("BAŞARILI: '{0}' toplu projesi oluşturuldu ({1} klips, {2} tabla)!\n", output3mf, count, plateCount));
+            return true;
+        }
+        catch (Exception ex)
+        {
+            fullLog(string.Format("KRİTİK HATA: {0}\n{1}", ex.Message, ex.StackTrace));
+            return false;
+        }
+    }
+
     // ==========================================
     // 6. CORE 3MF GENERATION ENGINE (İSİMLİ KLİPS & MARKA TİPİ)
     // ==========================================
@@ -4011,7 +5098,8 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                                          double stretchTop = 100.0, double stretchBot = 100.0,
                                          bool isMarkaTipi = false,
                                          string speedProfile = "fast",
-                                         bool useTurkishFix = true)
+                                         bool useTurkishFix = true,
+                                         bool autoSpread = false)
     {
         string logPath = Path.Combine(GetAppDataDir(), "generator.log");
         Action<string> fullLog = s =>
@@ -4148,10 +5236,10 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                 const double maxSpanMarka = 310.0;
                 const double centerAngleMarka = 234.082;
                 LastTextFitNote = null;
-                textTop = GenerateDistributedCylindricalText(topText, fontTop, textHeightTopMm, centerZTopLocal, centerAngleMarka, embedMm, embossMm, dynZScale, charGapTopMm, 0, widthScaleTop, maxSpanMarka, stretchTop / 100.0, true, 4.50, 0.0, useTurkishFix, surfaceSampler);
+                textTop = GenerateDistributedCylindricalText(topText, fontTop, textHeightTopMm, centerZTopLocal, centerAngleMarka, embedMm, embossMm, dynZScale, charGapTopMm, 0, widthScaleTop, maxSpanMarka, stretchTop / 100.0, true, 4.50, 0.0, useTurkishFix, surfaceSampler, -1.0, autoSpread);
                 if (LastTextFitNote != null) fullLog(LastTextFitNote);
                 LastTextFitNote = null;
-                textBot = GenerateDistributedCylindricalText(botText, fontBot, textHeightBotMm, centerZBotLocal, centerAngleMarka, embedMm, embossMm, dynZScale, charGapBotMm, 0, widthScaleBot, maxSpanMarka, stretchBot / 100.0, true, 4.50, 0.0, useTurkishFix, surfaceSampler);
+                textBot = GenerateDistributedCylindricalText(botText, fontBot, textHeightBotMm, centerZBotLocal, centerAngleMarka, embedMm, embossMm, dynZScale, charGapBotMm, 0, widthScaleBot, maxSpanMarka, stretchBot / 100.0, true, 4.50, 0.0, useTurkishFix, surfaceSampler, -1.0, autoSpread);
                 if (LastTextFitNote != null) fullLog(LastTextFitNote);
             }
             else
@@ -4159,10 +5247,10 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                 const double maxSpanIsimli = 258.0;
                 const double centerAngleIsimli = 236.0;
                 LastTextFitNote = null;
-                textTop = GenerateDistributedCylindricalText(topText, fontTop, textHeightTopMm, centerZTopLocal, centerAngleIsimli, embedMm, embossMm, dynZScale, charGapTopMm, 0, widthScaleTop, maxSpanIsimli, stretchTop / 100.0, false, 0.0, 0.0, useTurkishFix, surfaceSampler);
+                textTop = GenerateDistributedCylindricalText(topText, fontTop, textHeightTopMm, centerZTopLocal, centerAngleIsimli, embedMm, embossMm, dynZScale, charGapTopMm, 0, widthScaleTop, maxSpanIsimli, stretchTop / 100.0, false, 0.0, 0.0, useTurkishFix, surfaceSampler, -1.0, autoSpread);
                 if (LastTextFitNote != null) fullLog(LastTextFitNote);
                 LastTextFitNote = null;
-                textBot = GenerateDistributedCylindricalText(botText, fontBot, textHeightBotMm, centerZBotLocal, centerAngleIsimli, embedMm, embossMm, dynZScale, charGapBotMm, 0, widthScaleBot, maxSpanIsimli, stretchBot / 100.0, false, 0.0, 0.0, useTurkishFix, surfaceSampler);
+                textBot = GenerateDistributedCylindricalText(botText, fontBot, textHeightBotMm, centerZBotLocal, centerAngleIsimli, embedMm, embossMm, dynZScale, charGapBotMm, 0, widthScaleBot, maxSpanIsimli, stretchBot / 100.0, false, 0.0, 0.0, useTurkishFix, surfaceSampler, -1.0, autoSpread);
                 if (LastTextFitNote != null) fullLog(LastTextFitNote);
             }
 
@@ -5300,6 +6388,7 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
         private CardPanel grpBot;
         private TextBox txtTopText;
         private CheckBox chkSoftG;
+        private CheckBox chkAutoSpread;
         private TextBox txtBotText;
         private ComboBox cmbFontTop;
         private ComboBox cmbFontBot;
@@ -5360,6 +6449,8 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
         private Color currentColor3 = Color.FromArgb(255, 255, 255); // Beyaz (Extruder 3 - Sıralı Yazı Rengi)
 
         private Button btnGenerate;
+
+        private ModernButton btnPreview;
         private RadioButton rbSpeedFast;
         private RadioButton rbSpeedSlow;
         private Button btnOpenOrca;
@@ -5483,6 +6574,382 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
         // ------------------------------------------
         // KART: yuvarlak köşeli beyaz yüzey, başlığı kendisi çizer
         // ------------------------------------------
+        // ==========================================
+        // TOPLU ÜRETİM ÖNİZLEME KONTROLLERİ
+        // ==========================================
+
+        /// <summary>Tek klipsin 3D görünümü: yazılımla z-buffer çizim, sürükleyerek döndürme, tekerlekle yakınlaştırma.</summary>
+        public class ClipViewer : Control
+        {
+            private PigeonRingGenerator.PreviewMesh mesh;
+            private string status = "";
+            public float DefaultYaw = (float)(30.0 * Math.PI / 180.0), DefaultPitch = 0.32f;
+            private float yaw = (float)(30.0 * Math.PI / 180.0), pitch = 0.32f, zoom = 1.0f;
+            private Point downAt;
+            private int[] idBuf;
+            private int idW, idH, idSS;
+            public event Action<int> Picked;
+            private float cx, cy, cz, radius = 10f;
+            private Point last;
+            private bool dragging;
+
+            public ClipViewer()
+            {
+                SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+                BackColor = Color.FromArgb(236, 240, 245);
+                Cursor = Cursors.SizeAll;
+            }
+
+            public string Status { get { return status; } set { status = value ?? ""; Invalidate(); } }
+
+            public void SetMesh(PigeonRingGenerator.PreviewMesh m, bool resetView)
+            {
+                if (resetView) { yaw = DefaultYaw; pitch = DefaultPitch; zoom = 1f; }
+                Mesh = m;
+            }
+
+            public PigeonRingGenerator.PreviewMesh Mesh
+            {
+                get { return mesh; }
+                set
+                {
+                    mesh = value;
+                    if (mesh != null && mesh.Count > 0)
+                    {
+                        float x0 = float.MaxValue, y0 = float.MaxValue, z0 = float.MaxValue, x1 = float.MinValue, y1 = float.MinValue, z1 = float.MinValue;
+                        float[] p = mesh.P;
+                        for (int i = 0; i < p.Length; i += 3)
+                        {
+                            // tabla zemini (Obj = -1) sığdırmaya katılmaz: görünüm parçalara odaklanır
+                            if (mesh.Obj != null && mesh.Obj[i / 9] < 0) continue;
+                            if (p[i] < x0) x0 = p[i]; if (p[i] > x1) x1 = p[i];
+                            if (p[i + 1] < y0) y0 = p[i + 1]; if (p[i + 1] > y1) y1 = p[i + 1];
+                            if (p[i + 2] < z0) z0 = p[i + 2]; if (p[i + 2] > z1) z1 = p[i + 2];
+                        }
+                        if (x0 > x1) { x0 = y0 = z0 = 0; x1 = y1 = z1 = 10; }
+                        cx = (x0 + x1) / 2; cy = (y0 + y1) / 2; cz = (z0 + z1) / 2;
+                        radius = (float)Math.Sqrt((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0) + (z1 - z0) * (z1 - z0)) / 2;
+                        if (mesh.Obj != null) radius = Math.Max(radius * 1.15f, 30f);   // tablada biraz pay, tek klipste de çevre görünsün
+                    }
+                    Rerender();
+                }
+            }
+
+            protected override void OnMouseDown(MouseEventArgs e) { base.OnMouseDown(e); dragging = true; last = e.Location; downAt = e.Location; Focus(); }
+            protected override void OnMouseUp(MouseEventArgs e)
+            {
+                base.OnMouseUp(e);
+                bool wasDragging = dragging;
+                dragging = false;
+                if (Math.Abs(e.X - downAt.X) + Math.Abs(e.Y - downAt.Y) <= 3)
+                {
+                    if (Picked != null && idBuf != null && e.Button == MouseButtons.Left)
+                    {
+                        int px = e.X * idSS, py = e.Y * idSS;
+                        if (px >= 0 && py >= 0 && px < idW && py < idH)
+                        {
+                            int id = idBuf[py * idW + px];
+                            if (id >= 0) Picked(id);
+                        }
+                    }
+                }
+                else if (wasDragging) Rerender();   // bırakınca yumuşak kenarlı çizim
+            }
+            protected override void OnMouseMove(MouseEventArgs e)
+            {
+                base.OnMouseMove(e);
+                if (!dragging) return;
+                yaw += (e.X - last.X) * 0.012f;
+                pitch = Math.Max(-1.4f, Math.Min(1.4f, pitch + (e.Y - last.Y) * 0.012f));
+                last = e.Location;
+                Rerender();
+            }
+            protected override void OnMouseWheel(MouseEventArgs e)
+            {
+                base.OnMouseWheel(e);
+                zoom = Math.Max(0.6f, Math.Min(4f, zoom * (e.Delta > 0 ? 1.15f : 1 / 1.15f)));
+                Rerender();
+            }
+            protected override void OnMouseDoubleClick(MouseEventArgs e)
+            {
+                base.OnMouseDoubleClick(e);
+                yaw = DefaultYaw; pitch = DefaultPitch; zoom = 1f;
+                Rerender();
+            }
+            protected override void OnResize(EventArgs e) { base.OnResize(e); Rerender(); }
+
+            private void Rerender()
+            {
+                dirty = true;
+                Invalidate();   // çizim OnPaint'te; ardışık fare hareketleri tek kareye birleşir
+            }
+
+            private bool dirty = true;
+            private int[] rbuf, rids;
+            private float[] rzb;
+            private Bitmap frame;
+            private int frameW, frameH;
+
+            // Yazılımla z-buffer çizimi. Sürüklerken 1x (hızlı), bırakınca 2x (yumuşak kenar).
+            private void RenderFrame()
+            {
+                int ss = dragging ? 1 : 2;
+                int W = Math.Max(1, Width * ss), H = Math.Max(1, Height * ss);
+                int N = W * H;
+                if (rbuf == null || rbuf.Length != N) { rbuf = new int[N]; rzb = new float[N]; rids = new int[N]; }
+                if (frame == null || frameW != W || frameH != H)
+                {
+                    if (frame != null) frame.Dispose();
+                    frame = new Bitmap(W, H, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+                    frameW = W; frameH = H;
+                }
+                int bg = BackColor.ToArgb();
+                bool useIds = mesh.Obj != null;
+                for (int i = 0; i < N; i++) { rbuf[i] = bg; rzb[i] = float.MaxValue; }
+                if (useIds) for (int i = 0; i < N; i++) rids[i] = -1;
+
+                float cyw = (float)Math.Cos(yaw), syw = (float)Math.Sin(yaw), cp = (float)Math.Cos(pitch), sp = (float)Math.Sin(pitch);
+                float scale = Math.Min(W, H) * 0.46f / Math.Max(radius, 1e-3f) * zoom;
+                float ox = W / 2f, oy = H / 2f;
+                float[] p = mesh.P;
+                int[] cols = mesh.C;
+                int[] obj = mesh.Obj;
+                int n = mesh.Count;
+                float lx = -0.35f, ly = -0.75f, lz = 0.55f;
+                float ll = (float)Math.Sqrt(lx * lx + ly * ly + lz * lz); lx /= ll; ly /= ll; lz /= ll;
+
+                for (int t = 0; t < n; t++)
+                {
+                    int o = t * 9;
+                    float x, y, z, y1;
+                    x = p[o] - cx; y = p[o + 1] - cy; z = p[o + 2] - cz;
+                    float ax0 = x * cyw - y * syw; y1 = x * syw + y * cyw;
+                    float d0 = y1 * cp - z * sp, u0 = y1 * sp + z * cp;
+                    x = p[o + 3] - cx; y = p[o + 4] - cy; z = p[o + 5] - cz;
+                    float ax1 = x * cyw - y * syw; y1 = x * syw + y * cyw;
+                    float d1 = y1 * cp - z * sp, u1 = y1 * sp + z * cp;
+                    x = p[o + 6] - cx; y = p[o + 7] - cy; z = p[o + 8] - cz;
+                    float ax2 = x * cyw - y * syw; y1 = x * syw + y * cyw;
+                    float d2 = y1 * cp - z * sp, u2 = y1 * sp + z * cp;
+
+                    float sx0 = ox + ax0 * scale, sy0 = oy - u0 * scale;
+                    float sx1 = ox + ax1 * scale, sy1 = oy - u1 * scale;
+                    float sx2 = ox + ax2 * scale, sy2 = oy - u2 * scale;
+
+                    float minXf = Math.Min(sx0, Math.Min(sx1, sx2)), maxXf = Math.Max(sx0, Math.Max(sx1, sx2));
+                    float minYf = Math.Min(sy0, Math.Min(sy1, sy2)), maxYf = Math.Max(sy0, Math.Max(sy1, sy2));
+                    if (maxXf < 0 || maxYf < 0 || minXf >= W || minYf >= H) continue;
+                    float area = (sx1 - sx0) * (sy2 - sy0) - (sx2 - sx0) * (sy1 - sy0);
+                    if (area > -1e-6f && area < 1e-6f) continue;
+
+                    // gölgelendirme
+                    float ex = ax1 - ax0, ey = d1 - d0, ez = u1 - u0;
+                    float fx = ax2 - ax0, fy = d2 - d0, fz = u2 - u0;
+                    float nx = ey * fz - ez * fy, ny = ez * fx - ex * fz, nz = ex * fy - ey * fx;
+                    float nl = (float)Math.Sqrt(nx * nx + ny * ny + nz * nz);
+                    if (nl < 1e-12f) continue;
+                    float dot = (nx * lx + ny * ly + nz * lz) / nl;
+                    if (dot < 0) dot = -dot;
+                    float shade = 0.38f + 0.62f * dot;
+                    int c = cols[t];
+                    int col = unchecked((int)0xFF000000) | ((int)(((c >> 16) & 255) * shade) << 16) | ((int)(((c >> 8) & 255) * shade) << 8) | (int)((c & 255) * shade);
+                    int oid = useIds ? obj[t] : -1;
+
+                    int minX = Math.Max(0, (int)minXf), maxX = Math.Min(W - 1, (int)maxXf);
+                    int minY = Math.Max(0, (int)minYf), maxY = Math.Min(H - 1, (int)maxYf);
+                    float inv = 1f / area;
+                    // kenar fonksiyonları: x'te artımlı
+                    float a0 = (sy1 - sy2) * inv, a1 = (sy2 - sy0) * inv;   // dw/dx
+                    float px0 = minX + 0.5f;
+                    for (int yy = minY; yy <= maxY; yy++)
+                    {
+                        float py = yy + 0.5f;
+                        float w0 = ((sx1 - px0) * (sy2 - py) - (sx2 - px0) * (sy1 - py)) * inv;
+                        float w1 = ((sx2 - px0) * (sy0 - py) - (sx0 - px0) * (sy2 - py)) * inv;
+                        int idx = yy * W + minX;
+                        for (int xx = minX; xx <= maxX; xx++, idx++, w0 += a0, w1 += a1)
+                        {
+                            float w2 = 1f - w0 - w1;
+                            if (w0 < 0 || w1 < 0 || w2 < 0) continue;
+                            float d = w0 * d0 + w1 * d1 + w2 * d2;
+                            if (d < rzb[idx]) { rzb[idx] = d; rbuf[idx] = col; if (useIds) rids[idx] = oid; }
+                        }
+                    }
+                }
+
+                var bd = frame.LockBits(new Rectangle(0, 0, W, H), System.Drawing.Imaging.ImageLockMode.WriteOnly, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+                System.Runtime.InteropServices.Marshal.Copy(rbuf, 0, bd.Scan0, N);
+                frame.UnlockBits(bd);
+                if (useIds) { idBuf = (int[])rids.Clone(); idW = W; idH = H; idSS = ss; }
+                else idBuf = null;
+            }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                Graphics g = e.Graphics;
+                bool has = mesh != null && mesh.Count > 0 && Width > 4 && Height > 4;
+                if (has && dirty) { RenderFrame(); dirty = false; }
+                g.Clear(BackColor);
+                if (has && frame != null)
+                {
+                    if (frameW == Width && frameH == Height) g.DrawImageUnscaled(frame, 0, 0);
+                    else
+                    {
+                        g.InterpolationMode = InterpolationMode.HighQualityBilinear;
+                        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                        g.DrawImage(frame, new Rectangle(0, 0, Width, Height));
+                    }
+                }
+                g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+                using (Font f = new Font("Segoe UI", 8.5f))
+                using (Brush b = new SolidBrush(Color.FromArgb(100, 116, 139)))
+                {
+                    if (status.Length > 0)
+                    {
+                        using (StringFormat sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+                            g.DrawString(status, f, b, new RectangleF(0, 0, Width, Height), sf);
+                    }
+                    else if (has)
+                        g.DrawString("Sürükle: döndür · Tekerlek: yakınlaştır · Çift tık: sıfırla", f, b, 8, Height - 20);
+                }
+            }
+
+            protected override void Dispose(bool disposing)
+            {
+                if (disposing && frame != null) { frame.Dispose(); frame = null; }
+                base.Dispose(disposing);
+            }
+        }
+
+        /// <summary>Tablanın üstten görünümü: klipsler renk çiftleriyle, prime tower ve tabla sınırı. Tıklanan klips seçilir.</summary>
+        public class PlateView : Control
+        {
+            public const double BedMm = 270.0;
+            public const double ClipR = 8.0;
+            public double[] LX = new double[0], LY = new double[0];
+            public int[] PlateOf = new int[0];
+            public int Plate;
+            public int Selected = -1;
+            public Func<int, Color> DarkOf, LightOf;
+            public Func<int, bool> SeqOf;
+            public Func<int, string> LabelOf, TipOf;
+            public event Action<int> ClipClicked;
+            private int hover = -1;
+            private ToolTip tip = new ToolTip();
+
+            public PlateView()
+            {
+                SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+                BackColor = Color.White;
+                Cursor = Cursors.Hand;
+            }
+
+            private RectangleF BedRect()
+            {
+                float s = Math.Min(Width, Height) - 2;
+                return new RectangleF((Width - s) / 2f, (Height - s) / 2f, s, s);
+            }
+            private PointF ToScreen(double x, double y)
+            {
+                RectangleF r = BedRect();
+                float k = r.Width / (float)BedMm;
+                return new PointF(r.X + (float)x * k, r.Bottom - (float)y * k);
+            }
+            private int HitTest(Point pt)
+            {
+                RectangleF r = BedRect();
+                float k = r.Width / (float)BedMm;
+                int best = -1; double bd = (ClipR * k + 2) * (ClipR * k + 2);
+                for (int i = 0; i < LX.Length; i++)
+                {
+                    if (PlateOf[i] != Plate) continue;
+                    PointF c = ToScreen(LX[i], LY[i]);
+                    double d = (c.X - pt.X) * (c.X - pt.X) + (c.Y - pt.Y) * (c.Y - pt.Y);
+                    if (d < bd) { bd = d; best = i; }
+                }
+                return best;
+            }
+
+            protected override void OnMouseClick(MouseEventArgs e)
+            {
+                base.OnMouseClick(e);
+                int i = HitTest(e.Location);
+                if (i >= 0 && ClipClicked != null) ClipClicked(i);
+            }
+            protected override void OnMouseMove(MouseEventArgs e)
+            {
+                base.OnMouseMove(e);
+                int i = HitTest(e.Location);
+                if (i == hover) return;
+                hover = i;
+                tip.SetToolTip(this, i < 0 ? "" : (TipOf != null ? TipOf(i) : (LabelOf != null ? LabelOf(i) : "")));
+                Invalidate();
+            }
+            protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); hover = -1; Invalidate(); }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                Graphics g = e.Graphics;
+                g.Clear(BackColor);
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                RectangleF r = BedRect();
+                float k = r.Width / (float)BedMm;
+                using (Brush bed = new SolidBrush(Color.FromArgb(226, 230, 236))) g.FillRectangle(bed, r);
+                using (Pen grid = new Pen(Color.FromArgb(208, 214, 223)))
+                    for (int mm = 30; mm < BedMm; mm += 30)
+                    {
+                        g.DrawLine(grid, r.X + mm * k, r.Y, r.X + mm * k, r.Bottom);
+                        g.DrawLine(grid, r.X, r.Bottom - mm * k, r.Right, r.Bottom - mm * k);
+                    }
+                using (Pen border = new Pen(Color.FromArgb(148, 163, 184), 1.5f)) g.DrawRectangle(border, r.X, r.Y, r.Width, r.Height);
+                // prime tower (yaklaşık 25-55 x 195-225 mm)
+                PointF pt0 = ToScreen(25, 225);
+                RectangleF tower = new RectangleF(pt0.X, pt0.Y, 30 * k, 30 * k);
+                using (Brush tb = new SolidBrush(Color.FromArgb(160, 170, 185))) g.FillRectangle(tb, tower);
+                using (Font tf = new Font("Segoe UI", 7f))
+                using (Brush tt = new SolidBrush(Color.White))
+                using (StringFormat sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+                    g.DrawString("prime", tf, tt, tower, sf);
+
+                float cr = (float)ClipR * k;
+                using (Font lf = new Font("Segoe UI", Math.Max(6f, cr * 0.62f), FontStyle.Bold, GraphicsUnit.Pixel))
+                using (StringFormat sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+                {
+                    for (int i = 0; i < LX.Length; i++)
+                    {
+                        if (PlateOf[i] != Plate) continue;
+                        PointF c = ToScreen(LX[i], LY[i]);
+                        RectangleF cr2 = new RectangleF(c.X - cr, c.Y - cr, 2 * cr, 2 * cr);
+                        Color dk = DarkOf != null ? DarkOf(i) : Color.Gray, lt = LightOf != null ? LightOf(i) : Color.White;
+                        bool seq = SeqOf != null && SeqOf(i);
+                        if (seq)
+                        {
+                            using (Brush b = new SolidBrush(dk)) g.FillEllipse(b, cr2);
+                            string lbl = LabelOf != null ? LabelOf(i) : "";
+                            if (lbl.Length <= 3)
+                                using (Brush b = new SolidBrush(lt)) g.DrawString(lbl, lf, b, cr2, sf);
+                        }
+                        else
+                        {
+                            using (Brush b = new SolidBrush(lt)) g.FillPie(b, cr2.X, cr2.Y, cr2.Width, cr2.Height, 180, 180);
+                            using (Brush b = new SolidBrush(dk)) g.FillPie(b, cr2.X, cr2.Y, cr2.Width, cr2.Height, 0, 180);
+                        }
+                        float hole = cr * 0.45f;
+                        using (Brush hb = new SolidBrush(Color.FromArgb(120, 226, 230, 236)))
+                            if (!seq) g.FillEllipse(hb, c.X - hole, c.Y - hole, 2 * hole, 2 * hole);
+                        Color edge = i == Selected ? Color.FromArgb(37, 99, 235) : (i == hover ? Color.FromArgb(71, 85, 105) : Color.FromArgb(100, 116, 139));
+                        using (Pen pe = new Pen(edge, i == Selected ? 2.6f : 1f)) g.DrawEllipse(pe, cr2);
+                    }
+                }
+            }
+
+            protected override void Dispose(bool disposing)
+            {
+                if (disposing) tip.Dispose();
+                base.Dispose(disposing);
+            }
+        }
+
         public class CardPanel : Panel
         {
             public CardPanel()
@@ -5584,6 +7051,12 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                 if (inner is ComboBox)
                 {
                     inner.SetBounds(2, Math.Max(1, (Height - inner.Height) / 2), Width - 4, inner.Height);
+                    return;
+                }
+                TextBox tbm = inner as TextBox;
+                if (tbm != null && tbm.Multiline)
+                {
+                    inner.SetBounds(10, 8, Width - 20, Height - 16);
                     return;
                 }
                 int x = 11;
@@ -5802,6 +7275,7 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
         {
             public ButtonKind Kind = ButtonKind.Secondary;
             public string Icon = "";
+            public int GroupSide;   // 0: tek düğme, 1: grubun sol parçası, 2: grubun sağ parçası
             private bool active;
             private bool hover, pressed;
 
@@ -5859,6 +7333,8 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                 }
 
                 RectangleF r = new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f);
+                if (GroupSide == 1) r.Width += 16f;
+                else if (GroupSide == 2) { r.X -= 16f; r.Width += 16f; }
                 if (Kind == ButtonKind.Segment && active)
                 {
                     using (GraphicsPath sp = UiRound(new RectangleF(r.X, r.Y + 1f, r.Width, r.Height), radius))
@@ -6169,6 +7645,650 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
             return b;
         }
 
+        // ==========================================
+        // TOPLU ÜRETİM (çoklu isim x koyu-açık renk çiftleri x adet, tek 3MF)
+        // ==========================================
+        private Color[] batchFilColors;
+        private bool[] batchFilDark;
+        private Dictionary<string, int> batchQty = new Dictionary<string, int>();
+        private string batchNamesText;
+        private int batchPerPlate = 40;
+
+        private static readonly string[] BatchFilNames = { "F1", "F2", "F3", "F4" };
+
+        private void ShowBatchDialog()
+        {
+            if (batchFilColors == null)
+            {
+                batchFilColors = new Color[] { Color.FromArgb(0x1A, 0x4F, 0xD8), Color.White, Color.FromArgb(0xD8, 0x00, 0x00), Color.FromArgb(0xFF, 0xE6, 0x00) };
+                batchFilDark = new bool[] { true, false, true, false };
+            }
+            if (string.IsNullOrEmpty(batchNamesText))
+            {
+                string t = txtTopText != null ? txtTopText.Text.Trim() : "";
+                string b = txtBotText != null ? txtBotText.Text.Trim() : "";
+                batchNamesText = (t.Length > 0 || b.Length > 0) ? t + " | " + b : "";
+            }
+
+            const int leftW = 660, dlgW = 1080, cardW = leftW - 2 * UiMargin;
+            Form dlg = new Form
+            {
+                Text = "Toplu Üretim",
+                FormBorderStyle = FormBorderStyle.FixedDialog,
+                MaximizeBox = false,
+                MinimizeBox = false,
+                ShowInTaskbar = false,
+                StartPosition = FormStartPosition.CenterParent,
+                BackColor = UiBg,
+                Font = UiF(9f),
+                ClientSize = new Size(dlgW, 700),
+                KeyPreview = true
+            };
+            dlg.KeyDown += (s, e) => { if (e.KeyCode == Keys.Escape) dlg.Close(); };
+
+            // --- İsimler ---
+            CardPanel cNames = new CardPanel { Text = "İsimler", Location = new Point(UiMargin, UiMargin), Size = new Size(cardW, 214) };
+            dlg.Controls.Add(cNames);
+            Label hint = UiLabel(cNames, "Her satır bir klips:   EMRAH ÇELİK | 0506 938 19 49   ·   01-10   ·   DİŞİ", UiPad, 46, cardW - 2 * UiPad - 150);
+            ModernButton bHelp = UiButton(cNames, "Nasıl yazılır?", "", ButtonKind.Secondary, cardW - UiPad - 140, 12, 140, 32);
+            TextBox txtNames = new TextBox
+            {
+                Multiline = true,
+                ScrollBars = ScrollBars.Vertical,
+                AcceptsReturn = true,
+                WordWrap = false,
+                BorderStyle = BorderStyle.None,
+                Font = UiF(10f),
+                ForeColor = UiText,
+                BackColor = UiCard,
+                Text = (batchNamesText ?? "").Replace("\r\n", "\n").Replace("\n", "\r\n")
+            };
+            InputShell shNames = UiShell(cNames, txtNames, "", UiPad, 72, cardW - 2 * UiPad, 104);
+            bHelp.Click += (s, e) => ShowBatchHelp(dlg, txtNames);
+            Label lblNameInfo = UiLabel(cNames, "", UiPad, 184, cardW - 2 * UiPad);
+            lblNameInfo.Text = "Yazı ayarları ana pencereden alınır: isimler İsimli Klips, numaralar Sıralı Klips ayarlarıyla.";
+
+            // --- Filamentler ve renk çiftleri ---
+            CardPanel cCol = new CardPanel { Text = "Filamentler ve renk çiftleri", Location = new Point(UiMargin, cNames.Bottom + UiGap), Size = new Size(cardW, 346) };
+            dlg.Controls.Add(cCol);
+            UiLabel(cCol, "Makinedeki filamentler", UiPad, 50, 200);
+            Label lblRule = UiLabel(cCol, "İsimli: koyu = alt gövde + üst yazı, açık = üst gövde + alt yazı.\nSıralı: koyu = gövde, açık = numara. Adet her isim/numara içindir.", 244, 46, cardW - 244 - UiPad);
+            lblRule.Height = 36;
+            lblRule.AutoEllipsis = false;
+
+            SwatchButton[] sw = new SwatchButton[4];
+            Label[] hexL = new Label[4];
+            CheckBox[] darkT = new CheckBox[4];
+            Panel pairs = new Panel { Location = new Point(244, 92), Size = new Size(cardW - 244 - UiPad, 236), AutoScroll = true, BackColor = UiCard };
+            cCol.Controls.Add(pairs);
+
+            Label lblTotal = new Label { AutoSize = false, Font = UiF(9.5f, true), ForeColor = UiText, BackColor = UiBg, UseMnemonic = false };
+            Action refreshTotal = null;
+            Action rebuildPairs = null;
+
+            for (int i = 0; i < 4; i++)
+            {
+                int fi = i;
+                int y = 76 + i * 60;
+                sw[i] = UiSwatch(cCol, UiPad, y, batchFilColors[i], BatchFilNames[i], (s, e) =>
+                {
+                    using (ColorDialog cd = new ColorDialog { Color = batchFilColors[fi], FullOpen = true })
+                    {
+                        if (cd.ShowDialog(dlg) != DialogResult.OK) return;
+                        batchFilColors[fi] = cd.Color;
+                        sw[fi].BackColor = cd.Color;
+                        hexL[fi].Text = ColorToHex(cd.Color);
+                        rebuildPairs();
+                    }
+                }, BatchFilNames[i] + " rengi (tıklayıp değiştirin)");
+                hexL[i] = new Label { Text = ColorToHex(batchFilColors[i]), Location = new Point(UiPad + 40, y + 8), Size = new Size(70, 18), Font = UiF(8.75f), ForeColor = UiTextSoft, BackColor = UiCard };
+                cCol.Controls.Add(hexL[i]);
+                ToggleSwitch tg = new ToggleSwitch { Text = "Koyu", Checked = batchFilDark[i] };
+                darkT[i] = tg;
+                cCol.Controls.Add(tg);
+                tg.Size = new Size(tg.PreferredW, 24);
+                tg.Location = new Point(UiPad + 112, y + 4);
+                tg.CheckedChanged += (s, e) => { batchFilDark[fi] = darkT[fi].Checked; rebuildPairs(); };
+            }
+
+            List<int[]> pairKeys = new List<int[]>();
+            List<NumericUpDown> pairNums = new List<NumericUpDown>();
+            rebuildPairs = () =>
+            {
+                pairs.SuspendLayout();
+                List<Control> old = new List<Control>();
+                foreach (Control c in pairs.Controls) old.Add(c);
+                foreach (Control c in old) { pairs.Controls.Remove(c); c.Dispose(); }
+                pairKeys.Clear(); pairNums.Clear();
+                int row = 0;
+                for (int d = 0; d < 4; d++)
+                {
+                    if (!batchFilDark[d]) continue;
+                    for (int l = 0; l < 4; l++)
+                    {
+                        if (batchFilDark[l] || l == d) continue;
+                        string key = (d + 1) + "-" + (l + 1);
+                        int q; if (!batchQty.TryGetValue(key, out q)) q = 0;
+                        int y = row * 46;
+                        Color dc = batchFilColors[d], lc = batchFilColors[l];
+                        Panel chip = new Panel { Location = new Point(0, y + 4), Size = new Size(48, 28), BackColor = UiCard };
+                        chip.Paint += (s, e) =>
+                        {
+                            Graphics g = e.Graphics;
+                            g.SmoothingMode = SmoothingMode.AntiAlias;
+                            RectangleF r = new RectangleF(1, 1, 45, 25);
+                            using (GraphicsPath p = UiRound(r, 6f))
+                            {
+                                g.SetClip(p);
+                                using (Brush top = new SolidBrush(lc)) g.FillRectangle(top, 0, 0, 48, 14);
+                                using (Brush bot = new SolidBrush(dc)) g.FillRectangle(bot, 0, 14, 48, 14);
+                                g.ResetClip();
+                                using (Pen pen = new Pen(UiField)) g.DrawPath(pen, p);
+                            }
+                        };
+                        pairs.Controls.Add(chip);
+                        Label lbl = new Label
+                        {
+                            Text = string.Format("{0} koyu  +  {1} açık", BatchFilNames[d], BatchFilNames[l]),
+                            Location = new Point(58, y + 10), Size = new Size(160, 18), Font = UiF(9f), ForeColor = UiText, BackColor = UiCard
+                        };
+                        pairs.Controls.Add(lbl);
+                        NumericUpDown n = new NumericUpDown { Minimum = 0, Maximum = 500, Value = q, DecimalPlaces = 0, Increment = 1, BorderStyle = BorderStyle.None, Font = UiF(9.5f), ForeColor = UiText, BackColor = UiCard };
+                        if (n.Controls.Count > 0) n.Controls[0].Visible = false;
+                        UiShell(pairs, n, "adet", pairs.ClientSize.Width - 150, y, 128);
+                        string k2 = key;
+                        n.ValueChanged += (s, e) => { batchQty[k2] = (int)n.Value; refreshTotal(); };
+                        pairKeys.Add(new[] { d + 1, l + 1 });
+                        pairNums.Add(n);
+                        row++;
+                    }
+                }
+                if (row == 0)
+                {
+                    pairs.Controls.Add(new Label { Text = "En az bir koyu ve bir açık filament seçin.", Location = new Point(0, 8), AutoSize = true, Font = UiF(9f), ForeColor = UiMuted, BackColor = UiCard });
+                }
+                pairs.ResumeLayout();
+                refreshTotal();
+            };
+
+            // --- Alt satır ---
+            int by = cCol.Bottom + UiGap;
+            Label lblPer = new Label { Text = "Tabla başına en fazla", Location = new Point(UiMargin, by + 8), AutoSize = true, Font = UiF(8.75f), ForeColor = UiMuted, BackColor = UiBg };
+            dlg.Controls.Add(lblPer);
+            Panel perHost = new Panel { Location = new Point(UiMargin + 132, by), Size = new Size(118, UiShellH), BackColor = UiBg };
+            dlg.Controls.Add(perHost);
+            NumericUpDown numPer = new NumericUpDown { Minimum = 1, Maximum = 50, Value = Math.Max(1, Math.Min(50, batchPerPlate)), BorderStyle = BorderStyle.None, Font = UiF(9.5f), ForeColor = UiText, BackColor = UiCard };
+            if (numPer.Controls.Count > 0) numPer.Controls[0].Visible = false;
+            UiShell(perHost, numPer, "klips", 0, 0, 118);
+            uiTips.SetToolTip(numPer, "Bir tablaya yerleştirilecek en fazla klips. Fazlası sonraki tablalara geçer.");
+            lblTotal.Location = new Point(UiPad, 316);
+            lblTotal.Size = new Size(220, 20);
+            lblTotal.BackColor = UiCard;
+            cCol.Controls.Add(lblTotal);
+
+            Func<List<string[]>> parseNames = () =>
+            {
+                List<string[]> res = new List<string[]>();
+                foreach (string raw in txtNames.Text.Replace("\r", "").Split('\n'))
+                {
+                    string line = raw.Trim();
+                    if (line.Length == 0) continue;
+                    int bar = line.IndexOf('|');
+                    if (bar < 0)
+                    {
+                        // Sıralı numara: "01-10" aralığı ya da tek yazı (DİŞİ, ERKEK, 07 ...)
+                        System.Text.RegularExpressions.Match rm = System.Text.RegularExpressions.Regex.Match(line, @"^(\d{1,3})\s*-\s*(\d{1,3})$");
+                        int ra, rb;
+                        if (rm.Success && int.TryParse(rm.Groups[1].Value, out ra) && int.TryParse(rm.Groups[2].Value, out rb) && rb >= ra && rb - ra < 500)
+                        {
+                            foreach (string lbl in BuildLabels(ra, rb, false)) res.Add(new[] { lbl });
+                            continue;
+                        }
+                        res.Add(new[] { line });
+                        continue;
+                    }
+                    string top = bar >= 0 ? line.Substring(0, bar).Trim() : line;
+                    string bot = bar >= 0 ? line.Substring(bar + 1).Trim() : "";
+                    res.Add(new[] { top, bot });
+                }
+                return res;
+            };
+            // --- Önizleme: tabla (üstten) + seçili klips 3D ---
+            int pvX = leftW - UiMargin + UiGap;
+            CardPanel cPrev = new CardPanel { Text = "Önizleme", Location = new Point(pvX, UiMargin), Size = new Size(dlgW - UiMargin - pvX, by + 38 - UiMargin) };
+            dlg.Controls.Add(cPrev);
+            int pvIn = cPrev.Width - 2 * UiPad;
+            ModernButton bPrevPlate = UiButton(cPrev, "‹", "", ButtonKind.Secondary, cPrev.Width - UiPad - 32 - 96 - 32, 12, 32, 30);
+            Label lblPlate = new Label { Text = "", Location = new Point(cPrev.Width - UiPad - 32 - 96, 18), Size = new Size(96, 20), TextAlign = ContentAlignment.MiddleCenter, Font = UiF(9f, true), ForeColor = UiText, BackColor = UiCard };
+            cPrev.Controls.Add(lblPlate);
+            ModernButton bNextPlate = UiButton(cPrev, "›", "", ButtonKind.Secondary, cPrev.Width - UiPad - 32, 12, 32, 30);
+            PlateView plate = new PlateView { Location = new Point(UiPad, 50), Size = new Size(pvIn, 290) };
+            cPrev.Controls.Add(plate);
+            Label lblSel = new Label { Text = "", Location = new Point(UiPad, plate.Bottom + 8), Size = new Size(pvIn, 20), Font = UiF(9f), ForeColor = UiTextSoft, BackColor = UiCard, UseMnemonic = false, AutoEllipsis = true };
+            cPrev.Controls.Add(lblSel);
+            ClipViewer viewer = new ClipViewer { Location = new Point(UiPad, lblSel.Bottom + 6), Size = new Size(pvIn, cPrev.Height - lblSel.Bottom - 6 - UiPad) };
+            cPrev.Controls.Add(viewer);
+            uiTips.SetToolTip(plate, "Bir klipse tıklayın: aşağıda 3D görünür.");
+
+            string pvTpl = BatchTemplatePath();
+            PigeonRingGenerator.BatchTextSettings pvSet = ReadBatchTextSettings();
+            bool pvSoftG = chkSoftG != null && chkSoftG.Checked;
+            List<string[]> pvNames = new List<string[]>();
+            List<int[]> pvCombos = new List<int[]>();
+            List<int[]> pvInst = new List<int[]>();
+            int pvSel = 0, pvGen = 0, pvPlates = 0;
+            string pvKey = null;
+            System.Windows.Forms.Timer pvTimer = new System.Windows.Forms.Timer { Interval = 350 };
+            dlg.FormClosed += (s, e) => { pvTimer.Stop(); pvTimer.Dispose(); pvGen++; };
+
+            Func<List<int[]>> currentCombos = () =>
+            {
+                List<int[]> cl = new List<int[]>();
+                for (int k = 0; k < pairKeys.Count; k++)
+                    if (pairNums[k].Value > 0) cl.Add(new[] { pairKeys[k][0], pairKeys[k][1], (int)pairNums[k].Value });
+                return cl;
+            };
+            Func<int, string> clipText = i =>
+            {
+                string[] nm = pvNames[pvInst[i][0]];
+                return IsSeqEntry(nm) ? nm[0] : nm[0] + " / " + nm[1];
+            };
+            plate.DarkOf = i => batchFilColors[pvCombos[pvInst[i][1]][0] - 1];
+            plate.LightOf = i => batchFilColors[pvCombos[pvInst[i][1]][1] - 1];
+            plate.SeqOf = i => IsSeqEntry(pvNames[pvInst[i][0]]);
+            plate.LabelOf = i => pvNames[pvInst[i][0]][0];
+            plate.TipOf = i => string.Format("{0}. klips: {1}  (F{2} koyu + F{3} açık)", i + 1, clipText(i), pvCombos[pvInst[i][1]][0], pvCombos[pvInst[i][1]][1]);
+
+            Action updatePlateLabel = () =>
+            {
+                lblPlate.Text = pvPlates > 0 ? string.Format("Tabla {0} / {1}", plate.Plate + 1, pvPlates) : "Tabla yok";
+                bPrevPlate.Enabled = plate.Plate > 0;
+                bNextPlate.Enabled = plate.Plate < pvPlates - 1;
+                plate.Invalidate();
+            };
+            Action loadClip = () =>
+            {
+                if (pvSel < 0 || pvSel >= pvInst.Count)
+                {
+                    pvKey = null; pvGen++;
+                    lblSel.Text = "";
+                    viewer.Mesh = null;
+                    viewer.Status = "Önizleme için isim yazın ve bir renk çiftine adet girin.";
+                    return;
+                }
+                int[] inst = pvInst[pvSel];
+                string[] raw = pvNames[inst[0]];
+                int[] cb = pvCombos[inst[1]];
+                lblSel.Text = string.Format("{0}. klips: {1}  ·  F{2} koyu + F{3} açık", pvSel + 1, clipText(pvSel), cb[0], cb[1]);
+                string[] entry = IsSeqEntry(raw) ? new[] { raw[0] } : new[] { ProcessTextWithSoftG(raw[0], pvSoftG), ProcessTextWithSoftG(raw[1], pvSoftG) };
+                if (entry[0].Length == 0 || (entry.Length > 1 && entry[1].Length == 0))
+                {
+                    pvKey = null; pvGen++; viewer.Mesh = null; viewer.Status = "Bu satırda üst veya alt yazı eksik.";
+                    return;
+                }
+                Color dk = batchFilColors[cb[0] - 1], lt = batchFilColors[cb[1] - 1];
+                string key = string.Join("|", entry) + "#" + dk.ToArgb() + "#" + lt.ToArgb();
+                if (key == pvKey) return;
+                pvKey = key;
+                int gen = ++pvGen;
+                viewer.Status = "3D model hazırlanıyor...";
+                System.Threading.ThreadPool.QueueUserWorkItem(_ =>
+                {
+                    PigeonRingGenerator.PreviewMesh m = null;
+                    string err = null;
+                    try { m = BuildClipPreview(pvTpl, entry, dk, lt, pvSet); }
+                    catch (Exception ex) { err = ex.Message; }
+                    try
+                    {
+                        dlg.BeginInvoke(new Action(() =>
+                        {
+                            if (gen != pvGen || dlg.IsDisposed) return;
+                            viewer.Status = err != null ? "Önizleme hatası: " + err : "";
+                            viewer.Mesh = m;
+                        }));
+                    }
+                    catch { }
+                });
+            };
+            Action refreshPreview = () =>
+            {
+                pvNames = parseNames();
+                pvCombos = currentCombos();
+                pvInst = BuildBatchInstances(pvNames.Count, pvCombos);
+                double[] lx, ly; int[] po;
+                ComputeBatchLayout(pvInst.Count, (int)numPer.Value, out lx, out ly, out po);
+                plate.LX = lx; plate.LY = ly; plate.PlateOf = po;
+                pvPlates = po.Length > 0 ? po[po.Length - 1] + 1 : 0;
+                if (pvSel >= pvInst.Count) pvSel = pvInst.Count - 1;
+                if (pvSel < 0 && pvInst.Count > 0) pvSel = 0;
+                if (plate.Plate >= pvPlates) plate.Plate = Math.Max(0, pvPlates - 1);
+                plate.Selected = pvSel;
+                updatePlateLabel();
+                loadClip();
+            };
+            pvTimer.Tick += (s, e) => { pvTimer.Stop(); refreshPreview(); };
+            plate.ClipClicked += i => { pvSel = i; plate.Selected = i; plate.Invalidate(); loadClip(); };
+            bPrevPlate.Click += (s, e) => { if (plate.Plate > 0) { plate.Plate--; updatePlateLabel(); } };
+            bNextPlate.Click += (s, e) => { if (plate.Plate < pvPlates - 1) { plate.Plate++; updatePlateLabel(); } };
+
+            refreshTotal = () =>
+            {
+                int nNames = parseNames().Count;
+                int per = 0;
+                foreach (var n in pairNums) per += (int)n.Value;
+                int total = nNames * per;
+                int plates = total > 0 ? (total + (int)numPer.Value - 1) / (int)numPer.Value : 0;
+                lblTotal.Text = string.Format("Toplam {0} klips  ·  {1} tabla", total, plates);
+                pvTimer.Stop();
+                pvTimer.Start();
+            };
+            txtNames.TextChanged += (s, e) => refreshTotal();
+            numPer.ValueChanged += (s, e) => refreshTotal();
+
+            ModernButton bCancel = UiButton(dlg, "İptal", "", ButtonKind.Secondary, leftW - UiMargin - 200 - 8 - 96, by - 6, 96, 44);
+            ModernButton bGo = UiButton(dlg, "Toplu 3MF Oluştur", "", ButtonKind.Primary, leftW - UiMargin - 200, by - 6, 200, 44);
+            bGo.Font = UiF(10f, true);
+            bCancel.Click += (s, e) => dlg.Close();
+
+            List<string[]> chosenNames = null;
+            List<int[]> chosenCombos = null;
+            bGo.Click += (s, e) =>
+            {
+                List<string[]> nl = parseNames();
+                foreach (var nm in nl)
+                {
+                    if (nm.Length >= 2 && (nm[0].Length == 0 || nm[1].Length == 0))
+                    {
+                        MessageBox.Show(dlg, "İsimli satırda üst ve alt yazı '|' ile ayrılmış olmalı:\n\n" + nm[0] + " | " + nm[1], "Eksik yazı", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        return;
+                    }
+                }
+                List<int[]> cl = new List<int[]>();
+                for (int k = 0; k < pairKeys.Count; k++)
+                    if (pairNums[k].Value > 0) cl.Add(new[] { pairKeys[k][0], pairKeys[k][1], (int)pairNums[k].Value });
+                if (nl.Count == 0 || cl.Count == 0)
+                {
+                    MessageBox.Show(dlg, "En az bir isim satırı ve adedi 0'dan büyük bir renk çifti gerekli.", "Eksik bilgi", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+                chosenNames = nl;
+                chosenCombos = cl;
+                dlg.DialogResult = DialogResult.OK;
+                dlg.Close();
+            };
+
+            dlg.ClientSize = new Size(dlgW, by + 44 + UiMargin);
+            rebuildPairs();
+            DialogResult dr = dlg.ShowDialog(this);
+            batchNamesText = txtNames.Text;
+            batchPerPlate = (int)numPer.Value;
+            dlg.Dispose();
+            if (dr == DialogResult.OK && chosenNames != null) RunBatchGeneration(chosenNames, chosenCombos);
+        }
+
+        private string BatchTemplatePath()
+        {
+            string bakPath = GetDefaultBakPath("BOS_KLIPS_9MM.3mf.bak");
+            if (currentMode == GeneratorMode.IsimliKlips && txtBakPath != null && File.Exists(txtBakPath.Text.Trim())) bakPath = txtBakPath.Text.Trim();
+            return bakPath;
+        }
+
+        private PigeonRingGenerator.BatchTextSettings ReadBatchTextSettings()
+        {
+            PigeonRingGenerator.BatchTextSettings t = new PigeonRingGenerator.BatchTextSettings();
+            t.FontTop = cmbFontTop.SelectedItem != null ? cmbFontTop.SelectedItem.ToString() : "Trebuchet MS";
+            t.FontBot = cmbFontBot.SelectedItem != null ? cmbFontBot.SelectedItem.ToString() : "Trebuchet MS";
+            t.FontSeq = cmbSeqFont != null && cmbSeqFont.SelectedItem != null ? cmbSeqFont.SelectedItem.ToString() : t.FontTop;
+            t.HTop = (double)numTextHeightTop.Value; t.HBot = (double)numTextHeightBot.Value; t.HSeq = Math.Min(9.0, (double)numSeqHeight.Value);
+            t.GTop = (double)numCharGapTop.Value; t.GBot = (double)numCharGapBot.Value; t.GSeq = (double)numSeqGap.Value;
+            t.WTop = (double)numWidthScaleTop.Value; t.WBot = (double)numWidthScaleBot.Value; t.WSeq = (double)numSeqWidth.Value;
+            t.STop = numStretchTop != null ? (double)numStretchTop.Value : 100.0;
+            t.SBot = numStretchBot != null ? (double)numStretchBot.Value : 100.0;
+            t.SSeq = (double)numSeqStretch.Value;
+            t.Emboss = (double)numEmboss.Value;
+            t.Embed = (double)numEmbed.Value;
+            t.TurkishFix = chkSoftG != null && chkSoftG.Checked;
+            t.AutoSpread = chkAutoSpread != null && chkAutoSpread.Checked;
+            if (numChamfer != null) PigeonRingGenerator.DefaultOverhangChamferDeg = (double)numChamfer.Value;
+            return t;
+        }
+
+        // Toplu Üretim: isim kutusunun nasıl yazılacağını örnekle anlatan pencere
+        private void ShowBatchHelp(Form owner, TextBox target)
+        {
+            string[] exLines = { "EMRAH ÇELİK | 0506 938 19 49", "01-05", "DİŞİ" };
+            string example = string.Join("\r\n", exLines);
+            Color dark = Color.FromArgb(0x1A, 0x4F, 0xD8), light = Color.White;
+            const int w = 640;
+            Form h = new Form
+            {
+                Text = "Toplu Üretim: nasıl yazılır?",
+                FormBorderStyle = FormBorderStyle.FixedDialog,
+                MaximizeBox = false,
+                MinimizeBox = false,
+                ShowInTaskbar = false,
+                StartPosition = FormStartPosition.CenterParent,
+                BackColor = UiBg,
+                Font = UiF(9f),
+                KeyPreview = true
+            };
+            h.KeyDown += (s, e) => { if (e.KeyCode == Keys.Escape) h.Close(); };
+            int cardW = w - 2 * UiMargin;
+
+            // 1. Kutuya yazılan
+            CardPanel c1 = new CardPanel { Text = "1. Kutuya şunu yazarsanız", Location = new Point(UiMargin, UiMargin), Size = new Size(cardW, 150) };
+            h.Controls.Add(c1);
+            Panel box = new Panel { Location = new Point(UiPad, 48), Size = new Size(cardW - 2 * UiPad, 88), BackColor = UiCard };
+            box.Paint += (s, e) =>
+            {
+                Graphics g = e.Graphics;
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+                using (GraphicsPath p = UiRound(new RectangleF(0.5f, 0.5f, box.Width - 2, box.Height - 2), 8f))
+                using (Pen pen = new Pen(UiField)) g.DrawPath(pen, p);
+                using (Font mono = new Font("Consolas", 11f, FontStyle.Bold))
+                using (Font f2 = UiF(8.5f))
+                using (Brush tb = new SolidBrush(UiText))
+                using (Brush nb = new SolidBrush(UiMuted))
+                using (Brush cb = new SolidBrush(UiAccent))
+                {
+                    string[] notes = { "← İsimli klips: üst yazı | alt yazı", "← 01'den 05'e numaralar", "← tek yazı" };
+                    for (int i = 0; i < exLines.Length; i++)
+                    {
+                        float y = 10 + i * 24;
+                        g.DrawString((i + 1).ToString(), f2, nb, 10, y + 2);
+                        g.DrawString(exLines[i], mono, tb, 30, y);
+                        g.DrawString(notes[i], f2, cb, 340, y + 2);
+                    }
+                }
+            };
+            c1.Controls.Add(box);
+
+            // 2. Çıkan klipsler
+            CardPanel c2 = new CardPanel { Text = "2. Şu klipsler basılır", Location = new Point(UiMargin, c1.Bottom + UiGap), Size = new Size(cardW, 250) };
+            h.Controls.Add(c2);
+            Panel clips = new Panel { Location = new Point(UiPad, 46), Size = new Size(cardW - 2 * UiPad, 192), BackColor = UiCard };
+            clips.Paint += (s, e) =>
+            {
+                Graphics g = e.Graphics;
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+                using (Font cap = UiF(8.5f))
+                using (Brush capB = new SolidBrush(UiMuted))
+                {
+                    // Satır 1: isimli klips (üst yarı açık + koyu yazı, alt yarı koyu + açık yazı)
+                    DrawHelpClip(g, new RectangleF(0, 4, 230, 52), dark, light, "EMRAH ÇELİK", "0506 938 19 49");
+                    g.DrawString("1. satırdan: 1 isimli klips", cap, capB, 244, 22);
+                    // Satır 2: numaralar
+                    for (int i = 0; i < 5; i++)
+                        DrawHelpClip(g, new RectangleF(i * 62, 72, 54, 52), dark, light, (i + 1).ToString("D2"), null);
+                    g.DrawString("2. satırdan: 5 numara klipsi", cap, capB, 320, 90);
+                    // Satır 3
+                    DrawHelpClip(g, new RectangleF(0, 140, 84, 52), dark, light, "DİŞİ", null);
+                    g.DrawString("3. satırdan: 1 klips", cap, capB, 98, 158);
+                }
+                using (Font big = UiF(10f, true))
+                using (Brush tb = new SolidBrush(UiText))
+                    g.DrawString("= 7 farklı klips", big, tb, 400, 158);
+            };
+            c2.Controls.Add(clips);
+
+            // 3. Adet
+            CardPanel c3 = new CardPanel { Text = "3. Adet, her klipsten kaç tane basılacağıdır", Location = new Point(UiMargin, c2.Bottom + UiGap), Size = new Size(cardW, 112) };
+            h.Controls.Add(c3);
+            Panel qty = new Panel { Location = new Point(UiPad, 46), Size = new Size(cardW - 2 * UiPad, 54), BackColor = UiCard };
+            qty.Paint += (s, e) =>
+            {
+                Graphics g = e.Graphics;
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+                RectangleF chip = new RectangleF(0, 12, 48, 28);
+                using (GraphicsPath p = UiRound(chip, 6f))
+                {
+                    g.SetClip(p);
+                    using (Brush b1 = new SolidBrush(light)) g.FillRectangle(b1, chip.X, chip.Y, chip.Width, 14);
+                    using (Brush b2 = new SolidBrush(dark)) g.FillRectangle(b2, chip.X, chip.Y + 14, chip.Width, 14);
+                    g.ResetClip();
+                    using (Pen pen = new Pen(UiField)) g.DrawPath(pen, p);
+                }
+                using (Font f = UiF(10f))
+                using (Font fb = UiF(10f, true))
+                using (Brush tb = new SolidBrush(UiText))
+                using (Brush ab = new SolidBrush(UiAccent))
+                {
+                    g.DrawString("Mavi + beyaz çiftine  2 adet  yazarsanız:", f, tb, 58, 4);
+                    g.DrawString("7 klips × 2 adet = 14 klips basılır", fb, ab, 58, 28);
+                }
+            };
+            c3.Controls.Add(qty);
+
+            int by = c3.Bottom + UiGap;
+            ModernButton bClose = UiButton(h, "Kapat", "", ButtonKind.Secondary, w - UiMargin - 220 - 8 - 96, by, 96, 44);
+            ModernButton bIns = UiButton(h, "Bu örneği kutuya yaz", "", ButtonKind.Primary, w - UiMargin - 220, by, 220, 44);
+            bIns.Font = UiF(10f, true);
+            uiTips.SetToolTip(bIns, "Yukarıdaki 3 satırı isim kutusuna yazar; sonra kendi isimlerinizle değiştirin.");
+            bClose.Click += (s, e) => h.Close();
+            bIns.Click += (s, e) =>
+            {
+                string cur = target.Text.TrimEnd();
+                if (cur.Length > 0 && MessageBox.Show(h, "Kutudaki yazılar örnekle değiştirilsin mi?\n(Hayır derseniz örnek alta eklenir.)",
+                        "Örnek", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.No)
+                    target.Text = cur + "\r\n" + example;
+                else
+                    target.Text = example;
+                h.Close();
+            };
+            h.ClientSize = new Size(w, by + 44 + UiMargin);
+            h.ShowDialog(owner);
+            h.Dispose();
+        }
+
+        // Yardım penceresindeki küçük klips çizimi. bot == null: numara klipsi (koyu gövde, açık yazı).
+        private static void DrawHelpClip(Graphics g, RectangleF r, Color dark, Color light, string top, string bot)
+        {
+            using (GraphicsPath p = UiRound(r, 8f))
+            {
+                g.SetClip(p);
+                if (bot == null)
+                {
+                    using (Brush b = new SolidBrush(dark)) g.FillRectangle(b, r);
+                    using (Font f = UiF(12f, true))
+                    using (Brush tb = new SolidBrush(light))
+                    using (StringFormat sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+                        g.DrawString(top, f, tb, r, sf);
+                }
+                else
+                {
+                    RectangleF up = new RectangleF(r.X, r.Y, r.Width, r.Height / 2), lo = new RectangleF(r.X, r.Y + r.Height / 2, r.Width, r.Height / 2);
+                    using (Brush b1 = new SolidBrush(light)) g.FillRectangle(b1, up);
+                    using (Brush b2 = new SolidBrush(dark)) g.FillRectangle(b2, lo);
+                    using (Font f = UiF(9.5f, true))
+                    using (Brush db = new SolidBrush(dark))
+                    using (Brush lb = new SolidBrush(light))
+                    using (StringFormat sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+                    {
+                        g.DrawString(top, f, db, up, sf);
+                        g.DrawString(bot, f, lb, lo, sf);
+                    }
+                }
+                g.ResetClip();
+                using (Pen pen = new Pen(Color.FromArgb(203, 213, 225))) g.DrawPath(pen, p);
+            }
+        }
+
+        private void RunBatchGeneration(List<string[]> names, List<int[]> combos)
+        {
+            bool useSoftG = (chkSoftG != null && chkSoftG.Checked);
+            foreach (var nm in names) { if (IsSeqEntry(nm)) continue; nm[0] = ProcessTextWithSoftG(nm[0], useSoftG); nm[1] = ProcessTextWithSoftG(nm[1], useSoftG); }
+
+            int total = 0;
+            foreach (var c in combos) total += c[2];
+            total *= names.Count;
+
+            string outPath;
+            using (SaveFileDialog sfd = new SaveFileDialog())
+            {
+                sfd.Title = "Toplu Klips 3MF Dosyasını Kaydet";
+                sfd.Filter = "3MF Proje Dosyası (*.3mf)|*.3mf|Tüm Dosyalar (*.*)|*.*";
+                sfd.DefaultExt = "3mf";
+                sfd.AddExtension = true;
+                string dir = !string.IsNullOrEmpty(lastGeneratedPath) ? Path.GetDirectoryName(lastGeneratedPath) : null;
+                if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) dir = Path.GetDirectoryName(Application.ExecutablePath);
+                sfd.InitialDirectory = dir;
+                sfd.FileName = string.Format("Toplu Klips {0} adet.3mf", total);
+                if (sfd.ShowDialog(this) != DialogResult.OK) return;
+                outPath = sfd.FileName;
+            }
+
+            string bakPath = GetDefaultBakPath("BOS_KLIPS_9MM.3mf.bak");
+            if (currentMode == GeneratorMode.IsimliKlips && txtBakPath != null && File.Exists(txtBakPath.Text.Trim())) bakPath = txtBakPath.Text.Trim();
+            double emboss = (double)numEmboss.Value;
+            double embed = (double)numEmbed.Value;
+            if (numChamfer != null) PigeonRingGenerator.DefaultOverhangChamferDeg = (double)numChamfer.Value;
+            string material = cmbMaterial.SelectedItem != null ? cmbMaterial.SelectedItem.ToString() : "PLA";
+            string speed = (rbSpeedSlow != null && rbSpeedSlow.Checked) ? "slow" : "fast";
+            bool autoSpread = chkAutoSpread != null && chkAutoSpread.Checked;
+            string fontTop = cmbFontTop.SelectedItem != null ? cmbFontTop.SelectedItem.ToString() : "Trebuchet MS";
+            string fontBot = cmbFontBot.SelectedItem != null ? cmbFontBot.SelectedItem.ToString() : "Trebuchet MS";
+            double hTop = (double)numTextHeightTop.Value, hBot = (double)numTextHeightBot.Value;
+            double gTop = (double)numCharGapTop.Value, gBot = (double)numCharGapBot.Value;
+            double wTop = (double)numWidthScaleTop.Value, wBot = (double)numWidthScaleBot.Value;
+            double sTop = numStretchTop != null ? (double)numStretchTop.Value : 100.0;
+            double sBot = numStretchBot != null ? (double)numStretchBot.Value : 100.0;
+            string[] fil = new string[4];
+            for (int i = 0; i < 4; i++) fil[i] = ColorToHex(batchFilColors[i]);
+            int perPlate = batchPerPlate;
+            string fontSeq = cmbSeqFont != null && cmbSeqFont.SelectedItem != null ? cmbSeqFont.SelectedItem.ToString() : fontTop;
+            double seqH = Math.Min(9.0, (double)numSeqHeight.Value);
+            double seqStr = (double)numSeqStretch.Value;
+            double seqG = (double)numSeqGap.Value;
+            double seqW = (double)numSeqWidth.Value;
+
+            btnGenerate.Enabled = false;
+            btnGenerate.Text = "Oluşturuluyor...";
+            txtLog.Clear();
+            SetLogDrawer(true);
+
+            System.Threading.ThreadPool.QueueUserWorkItem(_ =>
+            {
+                bool success = ExecuteBatchGeneration(bakPath, outPath, names, combos, fil, emboss, embed, fontTop, fontBot,
+                    hTop, hBot, gTop, gBot, wTop, wBot, sTop, sBot, useSoftG, AppendLog, material, speed, autoSpread, perPlate,
+                    fontSeq, seqH, seqG, seqW, seqStr);
+                if (success) lastGeneratedPath = outPath;
+                this.Invoke(new Action(() =>
+                {
+                    btnGenerate.Enabled = true;
+                    btnGenerate.Text = GenerateButtonText();
+                    if (success)
+                        MessageBox.Show(string.Format("'{0}' toplu projesi üretildi.\n\n{1} klips, {2} tabla\nKonum: {3}",
+                            Path.GetFileName(outPath), total, (total + perPlate - 1) / perPlate, outPath),
+                            "İşlem Tamamlandı", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    else
+                        MessageBox.Show("Toplu üretim sırasında bir hata oluştu. Ayrıntılar işlem günlüğünde.", "Hata", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }));
+            });
+        }
+
         private void ShowLogWindow() { SetLogDrawer(true); }
 
         private void SetLogDrawer(bool open)
@@ -6295,6 +8415,10 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
             btnModeIsimli = UiButton(modeTrack, "İsimli Klips", "", ButtonKind.Segment, 4, 4, segW, segH);
             btnModeSirali = UiButton(modeTrack, "Sıralı Klips", "", ButtonKind.Segment, 4 + segW, 4, segW, segH);
             btnModeMarka = UiButton(modeTrack, "Marka Tipi", "", ButtonKind.Segment, 4 + 2 * segW, 4, segW, segH);
+            ModernButton btnBatch = UiButton(pnlHeader, "Toplu Üretim", "", ButtonKind.Secondary, modeTrack.Left - 12 - 128, (headerH - 36) / 2, 128, 36);
+            btnBatch.Click += (s, e) => ShowBatchDialog();
+            btnBatch.BringToFront();
+            uiTips.SetToolTip(btnBatch, "Birden çok isim ve koyu-açık renk çiftini adetleriyle tek 3MF'te üretir.");
             btnModeIsimli.Click += (s, e) => SetMode(GeneratorMode.IsimliKlips);
             btnModeSirali.Click += (s, e) => SetMode(GeneratorMode.SiraliKlips);
             btnModeMarka.Click += (s, e) => SetMode(GeneratorMode.MarkaTipi);
@@ -6333,9 +8457,23 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
             uiTips.SetToolTip(btnViewInfo, "Son üretilen dosyanın _bilgi.txt raporunu açar.");
             uiTips.SetToolTip(btnShowLog, "İşlem günlüğünü açar / kapatır (Esc ile kapanır).");
 
-            btnGenerate = UiButton(pnlFooter, "3MF Oluştur", "", ButtonKind.Primary, clientW - UiMargin - 220, 14, 220, 48);
+            btnPreview = UiButton(pnlFooter, UiIconsAvailable ? "" : "3D", "\uE890", ButtonKind.Primary, clientW - UiMargin - 52, 14, 52, 48);
+            btnPreview.GroupSide = 2;
+            btnPreview.AccessibleName = "3D Önizleme";
+            btnGenerate = UiButton(pnlFooter, "3MF Oluştur", "", ButtonKind.Primary, btnPreview.Left - 1 - 200, 14, 200, 48);
+            ((ModernButton)btnGenerate).GroupSide = 1;
             btnGenerate.Font = UiF(10.5f, true);
             btnGenerate.Click += BtnGenerate_Click;
+            btnPreview.Click += (s, e) =>
+            {
+                try { ShowProjectPreview(); }
+                catch (Exception ex)
+                {
+                    try { File.AppendAllText(Path.Combine(GetAppDataDir(), "generator.log"), "ÖNİZLEME HATASI: " + ex + "\r\n", Encoding.UTF8); } catch { }
+                    MessageBox.Show(this, "Önizleme açılamadı: " + ex.Message, "Önizleme", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+            };
+            uiTips.SetToolTip(btnPreview, "Önizleme: dosyayı kaydetmeden tablayı ve parçaları 3D gösterir.");
 
             // ==========================================
             // SOL ÜST: ÜST YAZI
@@ -6490,6 +8628,13 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
             // SAĞ ALT: BASKI AYARLARI (tüm modlar)
             // ==========================================
             grpParams = UiMakeCard("Baskı Ayarları", xR, yB);
+            ToggleSwitch tgSpread = new ToggleSwitch { Text = "Kısa yazıyı yaya yay", Checked = false };
+            chkAutoSpread = tgSpread;
+            grpParams.Controls.Add(chkAutoSpread);
+            chkAutoSpread.Size = new Size(tgSpread.PreferredW, 24);
+            chkAutoSpread.Location = new Point(UiCardW - UiPad - chkAutoSpread.Width, 15);
+            chkAutoSpread.CheckedChanged += (s, e) => UpdateFontPreview();
+            uiTips.SetToolTip(chkAutoSpread, "Açıkken, harf aralığı 0.00-0.05 mm olan kısa yazıların harfleri güvenli yay boyunca otomatik açılır.\nKapalıyken (varsayılan) yazı fontun doğal aralığıyla ortalanır.");
 
             UiLabel(grpParams, "Malzeme", UiCol(0), UiRow[0], UiColW);
             cmbMaterial = UiCombo(grpParams, UiCol(0), UiShellY(0), UiColW);
@@ -6932,6 +9077,8 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
             int halfH = (h - gap) / 2;
 
             const double bandHeightMm = 4.50;
+            bool spread = chkAutoSpread != null && chkAutoSpread.Checked;
+            double spanMm = currentMode == GeneratorMode.MarkaTipi ? SafeSpanMarkaMm : SafeSpanIsimliMm;
 
             if (currentMode == GeneratorMode.SiraliKlips)
             {
@@ -6955,7 +9102,7 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                     g.FillRectangle(bg, t1Rect);
                     g.DrawRectangle(borderPen, t1Rect.X, t1Rect.Y, t1Rect.Width - 1, t1Rect.Height - 1);
                     string stretchBadge = Math.Abs(seqStr - 1.0) > 0.01 ? string.Format("  ·  %{0:0}", seqStr * 100.0) : "";
-                    DrawScaledProportionalText(g, sampleNum, seqFont, txt, t1Rect, seqH, klipsHeightMm, seqW, seqG, seqStr);
+                    DrawScaledProportionalText(g, sampleNum, seqFont, txt, t1Rect, seqH, klipsHeightMm, seqW, seqG, seqStr, false, SafeSpanIsimliMm, spread);
                     DrawBadge(g, "TABLA 1  ·  DÜZ RENK" + stretchBadge, t1Rect.X + 6, t1Rect.Y + 5, currentColor3);
                 }
 
@@ -6980,7 +9127,7 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                     g.DrawRectangle(borderPen, t2Rect.X, t2Rect.Y, t2Rect.Width - 1, t2Rect.Height - 1);
 
                     string stretchBadge = Math.Abs(seqStr - 1.0) > 0.01 ? string.Format("  ·  %{0:0}", seqStr * 100.0) : "";
-                    DrawScaledProportionalText(g, sampleNum, seqFont, txt, t2Rect, seqH, klipsHeightMm, seqW, seqG, seqStr);
+                    DrawScaledProportionalText(g, sampleNum, seqFont, txt, t2Rect, seqH, klipsHeightMm, seqW, seqG, seqStr, false, SafeSpanIsimliMm, spread);
                     DrawBadge(g, "TABLA 2  ·  ÇİFT RENK" + stretchBadge, t2Rect.X + 6, t2Rect.Y + 5, currentColor3);
                 }
             }
@@ -7022,7 +9169,7 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                     g.DrawRectangle(borderPen, topRect.X, topRect.Y, topRect.Width - 1, topRect.Height - 1);
 
                     string stretchTopStr = Math.Abs(stretchTop - 1.0) > 0.01 ? string.Format("  ·  %{0:0}", stretchTop * 100.0) : "";
-                    DrawScaledProportionalText(g, topStr, fontTop, textTop, topRect, textHeightTop, bandHeightMm, boldnessTop, gapTop, stretchTop, useSoftG);
+                    DrawScaledProportionalText(g, topStr, fontTop, textTop, topRect, textHeightTop, bandHeightMm, boldnessTop, gapTop, stretchTop, useSoftG, spanMm, spread);
 
                     DrawBadge(g, "ÜST" + stretchTopStr, topRect.X + 6, topRect.Y + 5, currentColor1);
                 }
@@ -7037,7 +9184,7 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                     g.DrawRectangle(borderPen, botRect.X, botRect.Y, botRect.Width - 1, botRect.Height - 1);
 
                     string stretchBotStr = Math.Abs(stretchBot - 1.0) > 0.01 ? string.Format("  ·  %{0:0}", stretchBot * 100.0) : "";
-                    DrawScaledProportionalText(g, botStr, fontBot, textBot, botRect, textHeightBot, bandHeightMm, boldnessBot, gapBot, stretchBot, useSoftG);
+                    DrawScaledProportionalText(g, botStr, fontBot, textBot, botRect, textHeightBot, bandHeightMm, boldnessBot, gapBot, stretchBot, useSoftG, spanMm, spread);
 
                     DrawBadge(g, "ALT" + stretchBotStr, botRect.X + 6, botRect.Y + 5, currentColor2);
                 }
@@ -7046,32 +9193,96 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
 
         private void DrawBadge(Graphics g, string label, float x, float y, Color fg)
         {
+            DrawBadge(g, label, x, y, fg, Color.FromArgb(140, 15, 23, 42));
+        }
+
+        private void DrawBadge(Graphics g, string label, float x, float y, Color fg, Color bgColor)
+        {
             // Küçük, okunaklı etiket: yarı saydam koyu zemin üzerinde beyaz yazı (her renkte okunur)
             using (Font badgeFont = new Font("Segoe UI", 7f, FontStyle.Bold))
             {
                 SizeF sz = g.MeasureString(label, badgeFont);
                 RectangleF r = new RectangleF(x + 2, y + 2, sz.Width + 10, sz.Height + 3);
                 using (GraphicsPath bp = UiRound(r, r.Height / 2f))
-                using (Brush bg = new SolidBrush(Color.FromArgb(140, 15, 23, 42)))
+                using (Brush bg = new SolidBrush(bgColor))
                     g.FillPath(bg, bp);
                 g.DrawString(label, badgeFont, Brushes.White, new PointF(r.X + 5, r.Y + 1.5f));
             }
         }
 
-        private void DrawScaledProportionalText(Graphics g, string text, string fontName, Brush brush, Rectangle rect, double textHeightMm, double bandHeightMm, double boldnessMm = 0.0, double charGapMm = 0.0, double verticalStretch = 1.0, bool useTurkishFix = false)
-        {
-            if (string.IsNullOrEmpty(text)) return;
+        // Klipsin güvenli yazı yayı (mm): İsimli/Sıralı 258° x R 6.0369, Marka 310° x R 5.625 (üreticiyle aynı)
+        private static readonly double SafeSpanIsimliMm = 6.0369 * 258.0 * Math.PI / 180.0;   // 27.18 mm
+        private static readonly double SafeSpanMarkaMm = 4.50 * 1.25 * 310.0 * Math.PI / 180.0; // 30.43 mm
 
+        /// <summary>
+        /// Önizleme yazısını gerçek ölçüde (yatay ve dikey aynı px/mm, 1:1) çizer. rect = bandın tamamı,
+        /// spanMm x bandHeightMm = güvenli yazı alanı. Önizlemede otomatik sığdırma YOKTUR: yazı girilen boy ve
+        /// aralıkla çizilir; sınırı geçerse kırmızı çerçeve ve "TAŞTI" uyarısı gösterilir (üretim yine güvenli
+        /// sınırlarda küçültür).
+        /// </summary>
+        private void DrawScaledProportionalText(Graphics g, string text, string fontName, Brush brush, Rectangle rect, double textHeightMm, double bandHeightMm, double boldnessMm = 0.0, double charGapMm = 0.0, double verticalStretch = 1.0, bool useTurkishFix = false, double spanMm = 0.0, bool autoSpread = false)
+        {
+            if (spanMm <= 0.0) spanMm = SafeSpanIsimliMm;
             float stretchY = (float)verticalStretch;
             if (stretchY <= 0.1f) stretchY = 1.0f;
 
-            float pxPerMm = (float)rect.Height / (float)bandHeightMm;
-            float targetHeightPx = (float)(textHeightMm * pxPerMm);
-            if (targetHeightPx < 4f) targetHeightPx = 4f;
+            // 1:1 ölçek: güvenli alan banda sığacak en büyük ortak px/mm
+            float pxPerMm = Math.Min((rect.Width - 12f) / (float)spanMm, rect.Height / (float)bandHeightMm);
+            if (pxPerMm <= 0.1f) return;
+            float spanPx = (float)(spanMm * pxPerMm);
+            float bandPx = (float)(bandHeightMm * pxPerMm);
+            float midX = rect.X + rect.Width / 2f;
+            float cy = rect.Y + rect.Height / 2f;
+            RectangleF safe = new RectangleF(midX - spanPx / 2f, cy - bandPx / 2f, spanPx, bandPx);
 
+            // Güvenli yay dışı (kilit / menteşe / dikiş bölgesi) hafif karartılır
+            using (Brush dim = new SolidBrush(Color.FromArgb(60, 0, 0, 0)))
+            {
+                if (safe.Left > rect.Left) g.FillRectangle(dim, rect.Left, rect.Top, safe.Left - rect.Left, rect.Height);
+                if (safe.Right < rect.Right) g.FillRectangle(dim, safe.Right, rect.Top, rect.Right - safe.Right, rect.Height);
+                if (safe.Top > rect.Top + 0.5f) g.FillRectangle(dim, safe.Left, rect.Top, safe.Width, safe.Top - rect.Top);
+                if (safe.Bottom < rect.Bottom - 0.5f) g.FillRectangle(dim, safe.Left, safe.Bottom, safe.Width, rect.Bottom - safe.Bottom);
+            }
+
+            string overflow = null;
+            if (!string.IsNullOrEmpty(text))
+                overflow = DrawTrueScaleText(g, text, fontName, brush, rect, safe, pxPerMm, spanMm, bandHeightMm,
+                                             textHeightMm, boldnessMm, charGapMm, stretchY, useTurkishFix, autoSpread);
+
+            // Kilit sınırları: her zeminde görünen iki tonlu kesikli çizgi
+            using (Pen dark = new Pen(Color.FromArgb(150, 0, 0, 0), 1f))
+            using (Pen light = new Pen(Color.FromArgb(170, 255, 255, 255), 1f))
+            {
+                dark.DashPattern = new float[] { 3f, 3f };
+                light.DashPattern = new float[] { 3f, 3f };
+                light.DashOffset = 3f;
+                foreach (float x in new[] { safe.Left, safe.Right })
+                {
+                    if (x <= rect.Left + 1 || x >= rect.Right - 1) continue;
+                    g.DrawLine(dark, x, rect.Top + 1, x, rect.Bottom - 1);
+                    g.DrawLine(light, x, rect.Top + 1, x, rect.Bottom - 1);
+                }
+            }
+
+            if (overflow != null)
+            {
+                using (Pen red = new Pen(Color.FromArgb(230, 220, 38, 38), 2f))
+                    g.DrawRectangle(red, safe.X + 1, safe.Y + 1, safe.Width - 2, safe.Height - 2);
+                DrawBadge(g, "TAŞTI: " + overflow + " (Baskıda küçültülür)", rect.X + 6, rect.Bottom - 22, Color.White, Color.FromArgb(225, 200, 30, 30));
+            }
+        }
+
+        /// <summary>Yazıyı gerçek ölçüde çizer; sınır aşımı varsa açıklamasını döner, yoksa null.</summary>
+        private string DrawTrueScaleText(Graphics g, string text, string fontName, Brush brush, Rectangle rect, RectangleF safe,
+            float pxPerMm, double spanMm, double bandHeightMm, double textHeightMm, double boldnessMm, double charGapMm,
+            float stretchY, bool useTurkishFix, bool autoSpread)
+        {
+            double boldMm = Math.Max(0.0, boldnessMm);
+            float boldnessPx = (float)(boldMm * pxPerMm);
+            // Üreticiyle aynı: dış büyük harf boyu = harf boyu (kalınlık payı dahil)
+            float glyphPx = (float)(Math.Max(0.5, textHeightMm - 2.0 * boldMm) * pxPerMm);
+            if (glyphPx < 3f) glyphPx = 3f;
             float extraGapPx = (float)(charGapMm * pxPerMm);
-            float boldnessPx = (float)(boldnessMm * pxPerMm);
-            if (boldnessPx < 0f) boldnessPx = 0f;
 
             FontStyle style = FontStyle.Bold;
             FontFamily ff = FontManager.GetFontFamily(fontName);
@@ -7089,35 +9300,28 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                 }
             }
             catch { }
+            float emSize = refEmSize * (glyphPx / capHeightAtRef);
 
-            float emSize = refEmSize * (targetHeightPx / capHeightAtRef);
+            List<GraphicsPath> charPaths = new List<GraphicsPath>();
+            List<RectangleF> charB = new List<RectangleF>();
+            List<float> charOriginsX = new List<float>();
+            float textMinY = float.MaxValue, textMaxY = float.MinValue;
 
             using (Font finalFont = FontManager.CreateFont(fontName, emSize, style, GraphicsUnit.Pixel))
             {
                 List<RectangleF> naturalBounds = GetNaturalCharBounds(g, text, finalFont, StringFormat.GenericTypographic);
-
-                List<char> chars = new List<char>();
-                List<GraphicsPath> charPaths = new List<GraphicsPath>();
-                List<float> charOriginsX = new List<float>();
-
-                float minLeftPx = float.MaxValue;
-                float maxRightPx = float.MinValue;
-                float textMinY = float.MaxValue;
-                float textMaxY = float.MinValue;
                 int gIdx = 0;
                 float clearancePx = (float)((0.65 + Math.Min(0.0, charGapMm)) * pxPerMm);
                 float prevRightPx = float.MinValue;
-
                 for (int i = 0; i < text.Length; i++)
                 {
                     char c = text[i];
                     if (c == ' ') continue;
                     if (i >= naturalBounds.Count) break;
-
                     RectangleF nb = naturalBounds[i];
-
                     GraphicsPath gpChar = CreateCharPath(c, ff, (int)style, emSize, StringFormat.GenericTypographic, useTurkishFix);
                     RectangleF b = gpChar.GetBounds();
+                    if (b.Width <= 0 || b.Height <= 0) { gpChar.Dispose(); continue; }
 
                     float originX = nb.X + (gIdx * extraGapPx);
                     if (gIdx > 0 && prevRightPx > float.MinValue)
@@ -7126,112 +9330,99 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                         if (originX < reqOriginX) originX = reqOriginX;
                     }
                     prevRightPx = originX + b.Right + boldnessPx;
-                    chars.Add(c);
                     charPaths.Add(gpChar);
+                    charB.Add(b);
                     charOriginsX.Add(originX);
-
-                    float cLeft = originX + b.Left;
-                    float cRight = originX + b.Right + (boldnessPx * 2.0f);
-                    if (cLeft < minLeftPx) minLeftPx = cLeft;
-                    if (cRight > maxRightPx) maxRightPx = cRight;
-
                     if (b.Top < textMinY) textMinY = b.Top;
                     if (b.Bottom > textMaxY) textMaxY = b.Bottom;
-
                     gIdx++;
                 }
+            }
+            if (charPaths.Count == 0) return null;
 
-                if (chars.Count == 0) return;
-
-                // Üreticiyle aynı kural: aksanlar banda sığmıyorsa yalnızca aksanları basıklaştır,
-                // yine sığmıyorsa tüm yazıyı dikeyde küçült.
+            Func<float[]> extent = () =>
+            {
+                float l = float.MaxValue, r = float.MinValue;
+                for (int k = 0; k < charPaths.Count; k++)
                 {
-                    RectangleF hb;
-                    using (GraphicsPath gpH = new GraphicsPath())
-                    {
-                        gpH.AddString("H", ff, (int)style, emSize, new PointF(0, 0), StringFormat.GenericTypographic);
-                        hb = gpH.GetBounds();
-                    }
-                    double allowedMm = bandHeightMm > 5.0 ? 7.60 : 4.00;
-                    double embossMm = numEmboss != null ? (double)numEmboss.Value : 0.0;
-                    double chamferDeg = numChamfer != null ? (double)numChamfer.Value : 0.0;
-                    double chamferMm = (chamferDeg > 0.0 && chamferDeg < 89.0 && embossMm > 1e-4) ? embossMm / Math.Tan(chamferDeg * Math.PI / 180.0) : 0.0;
-                    float allowedPx = (float)((allowedMm - chamferMm) * pxPerMm);
-                    float abovePx = Math.Max(0f, hb.Top - textMinY) * stretchY;
-                    float belowPx = Math.Max(0f, textMaxY - hb.Bottom) * stretchY;
-                    double k = AccentCompressionFactor(targetHeightPx * stretchY, abovePx, belowPx, allowedPx);
-                    if (k < 0.999)
-                    {
-                        textMinY = float.MaxValue; textMaxY = float.MinValue;
-                        for (int ci = 0; ci < charPaths.Count; ci++)
-                        {
-                            charPaths[ci] = CompactAccents(charPaths[ci], hb.Top, hb.Bottom, (float)k);
-                            RectangleF nb = charPaths[ci].GetBounds();
-                            if (nb.Top < textMinY) textMinY = nb.Top;
-                            if (nb.Bottom > textMaxY) textMaxY = nb.Bottom;
-                        }
-                    }
-                    float totalPx = (textMaxY - textMinY + 2f * boldnessPx) * stretchY;
-                    if (totalPx > allowedPx && totalPx > 0f) stretchY *= allowedPx / totalPx;
+                    float cl = charOriginsX[k] + charB[k].Left - boldnessPx;
+                    float cr = charOriginsX[k] + charB[k].Right + 2f * boldnessPx;
+                    if (cl < l) l = cl;
+                    if (cr > r) r = cr;
                 }
+                return new[] { l, r };
+            };
+            float[] ext = extent();
+            float spanPx = (float)(spanMm * pxPerMm);
 
-                float totalW = maxRightPx - minLeftPx;
-                float textCenterY = (textMinY + textMaxY) * 0.5f;
-
-                // Yazı banda sığmıyorsa yatayda sıkıştır (üretici de uzun yazıyı yay boyunca yatayda sıkıştırır)
-                float availW = rect.Width - 16f;
-                float fitX = (totalW > availW && totalW > 0f) ? availW / totalW : 1.0f;
-                float midX = rect.X + rect.Width / 2f;
-                float textMidLocal = minLeftPx + totalW / 2f;
-                float cy = rect.Y + rect.Height / 2f;
-
-                GraphicsState clipState = g.Save();
-                g.SetClip(rect, CombineMode.Intersect);
-
-                try
+            // "Kısa yazıyı yaya yay" açıksa üreticiyle aynı kuralla harfleri güvenli yaya aç
+            float totalW0 = ext[1] - ext[0];
+            if (autoSpread && charPaths.Count > 1 && totalW0 < spanPx && charGapMm >= 0.0 && charGapMm <= 0.05)
+            {
+                float extra = (spanPx - totalW0) / (charPaths.Count - 1);
+                float maxAuto = (float)(((charPaths.Count >= 4) ? 2.60 : 1.50) * pxPerMm);
+                if (extra > maxAuto) extra = maxAuto;
+                if (extra > 0.05f * pxPerMm)
                 {
-                    for (int i = 0; i < chars.Count; i++)
-                    {
-                        char c = chars[i];
-                        GraphicsPath gp = charPaths[i];
-                        float originX = charOriginsX[i];
-
-                        if (gp != null)
-                        {
-                            GraphicsState gState = g.Save();
-                            try
-                            {
-                                g.TranslateTransform(midX + (originX - textMidLocal) * fitX, cy);
-                                if (Math.Abs(stretchY - 1.0f) > 0.001f || fitX < 0.999f)
-                                {
-                                    g.ScaleTransform(fitX, stretchY);
-                                }
-                                g.TranslateTransform(0, -textCenterY);
-
-                                g.FillPath(brush, gp);
-
-                                if (boldnessPx > 0.05f)
-                                {
-                                    using (Pen pen = new Pen(brush, boldnessPx * 2.0f))
-                                    {
-                                        pen.LineJoin = LineJoin.Round;
-                                        g.DrawPath(pen, gp);
-                                    }
-                                }
-                            }
-                            finally
-                            {
-                                g.Restore(gState);
-                                gp.Dispose();
-                            }
-                        }
-                    }
-                }
-                finally
-                {
-                    g.Restore(clipState);
+                    for (int k = 1; k < charOriginsX.Count; k++) charOriginsX[k] += k * extra;
+                    ext = extent();
                 }
             }
+
+            float totalW = ext[1] - ext[0];
+            float textMidLocal = (ext[0] + ext[1]) * 0.5f;
+            float textCenterY = (textMinY + textMaxY) * 0.5f;
+            float midX = safe.X + safe.Width / 2f;
+            float cy = safe.Y + safe.Height / 2f;
+
+            // Sınır kontrolü (üreticiyle aynı ölçüler)
+            double embossMm = numEmboss != null ? (double)numEmboss.Value : 0.0;
+            double chamferDeg = numChamfer != null ? (double)numChamfer.Value : 0.0;
+            double chamferMm = (chamferDeg > 0.0 && chamferDeg < 89.0 && embossMm > 1e-4) ? embossMm / Math.Tan(chamferDeg * Math.PI / 180.0) : 0.0;
+            double allowedMm = bandHeightMm > 5.0 ? 7.60 : 4.00;
+            double heightMm = (textMaxY - textMinY + 2f * boldnessPx) * stretchY / pxPerMm + chamferMm;
+            double widthMm = totalW / pxPerMm;
+            List<string> over = new List<string>();
+            if (heightMm > allowedMm + 0.005)
+                over.Add(string.Format(CultureInfo.InvariantCulture, "yükseklik {0:F2}/{1:F2} mm", heightMm, allowedMm));
+            if (widthMm > spanMm + 0.005)
+                over.Add(string.Format(CultureInfo.InvariantCulture, "genişlik {0:F2}/{1:F2} mm", widthMm, spanMm));
+
+            GraphicsState clipState = g.Save();
+            g.SetClip(rect, CombineMode.Intersect);
+            try
+            {
+                for (int i = 0; i < charPaths.Count; i++)
+                {
+                    GraphicsPath gp = charPaths[i];
+                    GraphicsState gState = g.Save();
+                    try
+                    {
+                        g.TranslateTransform(midX + (charOriginsX[i] - textMidLocal), cy);
+                        if (Math.Abs(stretchY - 1.0f) > 0.001f) g.ScaleTransform(1f, stretchY);
+                        g.TranslateTransform(0, -textCenterY);
+                        g.FillPath(brush, gp);
+                        if (boldnessPx > 0.05f)
+                        {
+                            using (Pen pen = new Pen(brush, boldnessPx * 2.0f))
+                            {
+                                pen.LineJoin = LineJoin.Round;
+                                g.DrawPath(pen, gp);
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        g.Restore(gState);
+                        gp.Dispose();
+                    }
+                }
+            }
+            finally
+            {
+                g.Restore(clipState);
+            }
+            return over.Count > 0 ? string.Join(" · ", over.ToArray()) : null;
         }
 
         private void UpdateFontPreview()
@@ -7405,6 +9596,282 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
             }
         }
 
+        // ==========================================
+        // ÖNİZLEME PENCERESİ (İsimli, Sıralı, Marka): üretimi geçici dosyaya yapar, tabla ve parçaları 3D gösterir
+        // ==========================================
+        private void ShowProjectPreview()
+        {
+            Func<string, Action<string>, bool> job = PrepareGenerationJob();
+            if (job == null) return;
+            string modeName = currentMode == GeneratorMode.SiraliKlips ? "Sıralı Klips" : (currentMode == GeneratorMode.MarkaTipi ? "Marka Tipi" : "İsimli Klips");
+            string tmpDir = Path.Combine(Path.GetTempPath(), "pigeon_onizleme");
+            try { Directory.CreateDirectory(tmpDir); } catch { }
+            string tmp = Path.Combine(tmpDir, "onizleme_" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".3mf");
+
+            const int W = 1040, H = 700;
+            Form f = new Form
+            {
+                Text = "Önizleme: " + modeName,
+                FormBorderStyle = FormBorderStyle.Sizable,
+                MinimizeBox = false,
+                ShowInTaskbar = false,
+                StartPosition = FormStartPosition.CenterParent,
+                BackColor = UiBg,
+                Font = UiF(9f),
+                ClientSize = new Size(W, H),
+                MinimumSize = new Size(760, 520),
+                KeyPreview = true
+            };
+            f.KeyDown += (s, e) => { if (e.KeyCode == Keys.Escape) f.Close(); };
+
+            // Üst çubuk
+            Panel top = new Panel { Dock = DockStyle.Top, Height = 64, BackColor = UiBg };
+            f.Controls.Add(top);
+            Label title = new Label { Text = modeName + " önizleme", Location = new Point(UiMargin, 20), AutoSize = true, Font = UiF(12f, true), ForeColor = UiText, BackColor = UiBg };
+            top.Controls.Add(title);
+            Panel seg = new Panel { Size = new Size(204, 36), BackColor = UiTrack };
+            top.Controls.Add(seg);
+            ModernButton bPlateMode = new ModernButton { Text = "Tabla", Kind = ButtonKind.Segment, Location = new Point(3, 3), Size = new Size(98, 30), Active = true };
+            ModernButton bPartMode = new ModernButton { Text = "Parça", Kind = ButtonKind.Segment, Location = new Point(103, 3), Size = new Size(98, 30) };
+            seg.Controls.Add(bPlateMode); seg.Controls.Add(bPartMode);
+            ModernButton bPrev = UiButton(top, "‹", "", ButtonKind.Secondary, 0, 16, 32, 32);
+            Label lblPlate = new Label { Text = "", Size = new Size(110, 20), TextAlign = ContentAlignment.MiddleCenter, Font = UiF(9.5f, true), ForeColor = UiText, BackColor = UiBg };
+            top.Controls.Add(lblPlate);
+            ModernButton bNext = UiButton(top, "›", "", ButtonKind.Secondary, 0, 16, 32, 32);
+
+            // Alt çubuk
+            Panel bottom = new Panel { Dock = DockStyle.Bottom, Height = 72, BackColor = UiBg };
+            f.Controls.Add(bottom);
+            Label lblInfo = new Label { Text = "", Location = new Point(UiMargin, 28), AutoSize = false, Size = new Size(560, 20), Font = UiF(9f), ForeColor = UiMuted, BackColor = UiBg, AutoEllipsis = true, UseMnemonic = false };
+            bottom.Controls.Add(lblInfo);
+            ModernButton bClose = UiButton(bottom, "Kapat", "", ButtonKind.Secondary, 0, 14, 96, 44);
+            ModernButton bGen = UiButton(bottom, GenerateButtonText(), "", ButtonKind.Primary, 0, 14, 220, 44);
+            bGen.Font = UiF(10f, true);
+
+            // Gövde: solda parça listesi, sağda 3D
+            Panel body = new Panel { Dock = DockStyle.Fill, BackColor = UiBg, Padding = new Padding(UiMargin, 0, UiMargin, 0) };
+            f.Controls.Add(body);
+            body.BringToFront();
+            CardPanel cList = new CardPanel { Text = "Parçalar", Dock = DockStyle.Left, Width = 250 };
+            body.Controls.Add(cList);
+            ListBox lst = new ListBox { BorderStyle = BorderStyle.None, Font = UiF(9.5f), ForeColor = UiText, BackColor = UiCard, IntegralHeight = false, DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = 28 };
+            cList.Controls.Add(lst);
+            Panel gap = new Panel { Dock = DockStyle.Left, Width = UiGap, BackColor = UiBg };
+            body.Controls.Add(gap);
+            gap.BringToFront();
+            ClipViewer viewer = new ClipViewer { Dock = DockStyle.Fill, Status = "Model hazırlanıyor... (birkaç saniye sürebilir)" };
+            body.Controls.Add(viewer);
+            viewer.BringToFront();
+
+            Action layout = () =>
+            {
+                int cw = top.ClientSize.Width;
+                bNext.Location = new Point(cw - UiMargin - 32, 16);
+                lblPlate.Location = new Point(bNext.Left - 4 - 110, 22);
+                bPrev.Location = new Point(lblPlate.Left - 4 - 32, 16);
+                seg.Location = new Point(bPrev.Left - 24 - seg.Width, 14);
+                int bw = bottom.ClientSize.Width;
+                bGen.Location = new Point(bw - UiMargin - bGen.Width, 14);
+                bClose.Location = new Point(bGen.Left - 8 - bClose.Width, 14);
+                lblInfo.Width = Math.Max(100, bClose.Left - UiMargin - 16);
+                lst.SetBounds(12, 44, cList.ClientSize.Width - 24, cList.ClientSize.Height - 56);
+            };
+            f.Resize += (s, e) => layout();
+
+            ProjectPreview pp = null;
+            bool plateMode = true;
+            int curPlate = 0, curPart = -1;
+            List<int> listIdx = new List<int>();
+            Dictionary<int, PreviewMesh> plateCache = new Dictionary<int, PreviewMesh>();
+
+            Action refresh = null;
+            Action<bool> showView = resetView =>
+            {
+                if (pp == null) return;
+                if (plateMode)
+                {
+                    PreviewMesh pm;
+                    if (!plateCache.TryGetValue(curPlate, out pm)) { pm = BuildPlatePreview(pp, curPlate, PlateView.BedMm); plateCache[curPlate] = pm; }
+                    viewer.DefaultYaw = 0f; viewer.DefaultPitch = 0.62f;
+                    viewer.SetMesh(pm, resetView);
+                    int n = 0; foreach (int p in pp.PlateOf) if (p == curPlate) n++;
+                    lblInfo.Text = string.Format("Tabla {0}: {1} parça. Bir parçaya tıklayınca yakından gösterilir. Sürükle: döndür · Tekerlek: yakınlaştır · Çift tık: sıfırla", curPlate + 1, n);
+                }
+                else if (curPart >= 0)
+                {
+                    viewer.DefaultYaw = 0f; viewer.DefaultPitch = 0.32f;
+                    viewer.SetMesh(pp.Meshes[curPart], resetView);
+                    lblInfo.Text = string.Format("{0}  ·  Tabla {1}", pp.Names[curPart], pp.PlateOf[curPart] + 1);
+                }
+            };
+            refresh = () =>
+            {
+                if (pp == null) return;
+                lblPlate.Text = string.Format("Tabla {0} / {1}", curPlate + 1, pp.Plates);
+                bPrev.Enabled = curPlate > 0;
+                bNext.Enabled = curPlate < pp.Plates - 1;
+                bPlateMode.Active = plateMode; bPartMode.Active = !plateMode;
+                lst.BeginUpdate();
+                lst.Items.Clear(); listIdx.Clear();
+                for (int i = 0; i < pp.Meshes.Count; i++)
+                {
+                    if (pp.PlateOf[i] != curPlate) continue;
+                    listIdx.Add(i);
+                    lst.Items.Add(pp.Names[i]);
+                }
+                lst.EndUpdate();
+                int sel = listIdx.IndexOf(curPart);
+                lst.SelectedIndex = (!plateMode && sel >= 0) ? sel : -1;
+            };
+            lst.DrawItem += (s, e) =>
+            {
+                if (e.Index < 0) return;
+                bool selected = (e.State & DrawItemState.Selected) != 0;
+                using (Brush bg = new SolidBrush(selected ? Color.FromArgb(219, 234, 254) : UiCard)) e.Graphics.FillRectangle(bg, e.Bounds);
+                int oi = listIdx[e.Index];
+                PreviewMesh m = pp.Meshes[oi];
+                // nesnenin iki baskın rengi
+                Dictionary<int, int> cnt = new Dictionary<int, int>();
+                foreach (int c in m.C) { int v; cnt.TryGetValue(c, out v); cnt[c] = v + 1; }
+                List<KeyValuePair<int, int>> cs = new List<KeyValuePair<int, int>>(cnt);
+                cs.Sort((a, b) => b.Value.CompareTo(a.Value));
+                Rectangle chip = new Rectangle(e.Bounds.X + 4, e.Bounds.Y + 7, 22, 14);
+                if (cs.Count > 0) using (Brush b1 = new SolidBrush(Color.FromArgb(cs[0].Key))) e.Graphics.FillRectangle(b1, chip.X, chip.Y, 11, 14);
+                using (Brush b2 = new SolidBrush(Color.FromArgb(cs.Count > 1 ? cs[1].Key : (cs.Count > 0 ? cs[0].Key : 0)))) e.Graphics.FillRectangle(b2, chip.X + 11, chip.Y, 11, 14);
+                using (Pen pen = new Pen(UiField)) e.Graphics.DrawRectangle(pen, chip);
+                TextRenderer.DrawText(e.Graphics, lst.Items[e.Index].ToString(), lst.Font, new Rectangle(e.Bounds.X + 34, e.Bounds.Y, e.Bounds.Width - 36, e.Bounds.Height), UiText,
+                    TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+            };
+            lst.SelectedIndexChanged += (s, e) =>
+            {
+                if (pp == null || lst.SelectedIndex < 0) return;
+                int oi = listIdx[lst.SelectedIndex];
+                if (!plateMode && oi == curPart) return;
+                curPart = oi; plateMode = false;
+                bPlateMode.Active = false; bPartMode.Active = true;
+                showView(true);
+            };
+            viewer.Picked += oi =>
+            {
+                if (pp == null || oi < 0) return;
+                curPart = oi; plateMode = false;
+                refresh(); showView(true);
+            };
+            bPlateMode.Click += (s, e) => { if (pp == null || plateMode) return; plateMode = true; refresh(); showView(true); };
+            bPartMode.Click += (s, e) =>
+            {
+                if (pp == null || !plateMode) return;
+                if (curPart < 0 || pp.PlateOf[curPart] != curPlate) curPart = listIdx.Count > 0 ? listIdx[0] : -1;
+                if (curPart < 0) return;
+                plateMode = false; refresh(); showView(true);
+            };
+            bPrev.Click += (s, e) => { if (pp != null && curPlate > 0) { curPlate--; if (!plateMode) curPart = -1; plateMode = true; refresh(); showView(true); } };
+            bNext.Click += (s, e) => { if (pp != null && curPlate < pp.Plates - 1) { curPlate++; if (!plateMode) curPart = -1; plateMode = true; refresh(); showView(true); } };
+            bClose.Click += (s, e) => f.Close();
+            bool generateAfter = false;
+            bGen.Click += (s, e) => { generateAfter = true; f.Close(); };
+            bPrev.Enabled = bNext.Enabled = false;
+
+            f.Shown += (s, e) =>
+            {
+                layout();
+                System.Threading.ThreadPool.QueueUserWorkItem(_ =>
+                {
+                    ProjectPreview res = null;
+                    string err = null;
+                    try
+                    {
+                        if (!job(tmp, null)) err = "Model üretilemedi. Ayrıntılar işlem günlüğünde (generator.log).";
+                        else res = LoadProjectPreview(tmp);
+                    }
+                    catch (Exception ex) { err = ex.Message; }
+                    finally
+                    {
+                        try
+                        {
+                            foreach (string fp in Directory.GetFiles(tmpDir, Path.GetFileNameWithoutExtension(tmp) + "*")) File.Delete(fp);
+                        }
+                        catch { }
+                    }
+                    try
+                    {
+                        f.BeginInvoke(new Action(() =>
+                        {
+                            if (f.IsDisposed) return;
+                            if (err != null) { viewer.Status = "Önizleme hatası: " + err; return; }
+                            pp = res;
+                            viewer.Status = "";
+                            refresh();
+                            showView(true);
+                        }));
+                    }
+                    catch { }
+                });
+            };
+            f.ShowDialog(this);
+            f.Dispose();
+            if (generateAfter) BtnGenerate_Click(this, EventArgs.Empty);
+        }
+
+        /// <summary>Ana penceredeki ayarları okur ve doğrular; verilen çıktı yoluna üretimi yapan işi döndürür (hata varsa null).</summary>
+        private Func<string, Action<string>, bool> PrepareGenerationJob()
+        {
+            string bakPath = txtBakPath.Text.Trim();
+            if (!File.Exists(bakPath))
+            {
+                MessageBox.Show(string.Format("Şablon dosya bulunamadı:\n{0}", bakPath), "Hata", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return null;
+            }
+            double emboss = (double)numEmboss.Value;
+            double embed = (double)numEmbed.Value;
+            if (numChamfer != null) PigeonRingGenerator.DefaultOverhangChamferDeg = (double)numChamfer.Value;
+            string material = cmbMaterial.SelectedItem != null ? cmbMaterial.SelectedItem.ToString() : "PLA";
+            string color1Hex = ColorToHex(currentColor1);
+            string color2Hex = ColorToHex(currentColor2);
+            string color3Hex = ColorToHex(currentColor3);
+            string speed = (rbSpeedSlow != null && rbSpeedSlow.Checked) ? "slow" : "fast";
+            bool autoSpread = chkAutoSpread != null && chkAutoSpread.Checked;
+            bool isMarka = (currentMode == GeneratorMode.MarkaTipi);
+
+            if (currentMode == GeneratorMode.SiraliKlips)
+            {
+                int sNum = (int)numSeqStart.Value;
+                int eNum = (int)numSeqEnd.Value;
+                if (eNum < sNum) eNum = sNum;
+                bool incGen = chkIncludeGender.Checked;
+                string fontSeq = cmbSeqFont != null && cmbSeqFont.SelectedItem != null ? cmbSeqFont.SelectedItem.ToString() : "Trebuchet MS";
+                double seqH = Math.Min(9.0, (double)numSeqHeight.Value);
+                double seqStr = (double)numSeqStretch.Value;
+                double seqG = (double)numSeqGap.Value;
+                double seqW = (double)numSeqWidth.Value;
+                double seqLH = GetSelectedSeqLayerHeight();
+                return (outPath, log) => ExecuteSequentialGeneration(bakPath, outPath, sNum, eNum, incGen, seqH, emboss, embed,
+                    fontSeq, seqG, seqW, log, material, color1Hex, color2Hex, color3Hex, seqStr, speed, seqLH, autoSpread);
+            }
+
+            bool useSoftG = (chkSoftG != null && chkSoftG.Checked);
+            string topText = ProcessTextWithSoftG(txtTopText.Text.Trim(), useSoftG);
+            string botText = ProcessTextWithSoftG(txtBotText.Text.Trim(), useSoftG);
+            if (string.IsNullOrEmpty(topText) || string.IsNullOrEmpty(botText))
+            {
+                MessageBox.Show("Lütfen üst ve alt yazı alanlarını boş bırakmayınız.", "Uyarı", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return null;
+            }
+            string fontTop = cmbFontTop.SelectedItem != null ? cmbFontTop.SelectedItem.ToString() : "Trebuchet MS";
+            string fontBot = cmbFontBot.SelectedItem != null ? cmbFontBot.SelectedItem.ToString() : "Trebuchet MS";
+            double textHTop = (double)numTextHeightTop.Value;
+            double textHBot = (double)numTextHeightBot.Value;
+            double gapTop = (double)numCharGapTop.Value;
+            double gapBot = (double)numCharGapBot.Value;
+            double scaleTop = (double)numWidthScaleTop.Value;
+            double scaleBot = (double)numWidthScaleBot.Value;
+            double stretchTop = numStretchTop != null ? (double)numStretchTop.Value : 100.0;
+            double stretchBot = numStretchBot != null ? (double)numStretchBot.Value : 100.0;
+            return (outPath, log) => ExecuteGeneration(topText, botText, bakPath, outPath, emboss, embed, fontTop, fontBot,
+                textHTop, textHBot, gapTop, gapBot, scaleTop, scaleBot, log, material, color1Hex, color2Hex,
+                stretchTop, stretchBot, isMarka, speed, useSoftG, autoSpread);
+        }
+
         private void BtnGenerate_Click(object sender, EventArgs e)
         {
             string bakPath = txtBakPath.Text.Trim();
@@ -7487,6 +9954,9 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
 
             string chosenSafeName = Path.GetFileNameWithoutExtension(outPath);
             string chosenSpeedProfile = (rbSpeedSlow != null && rbSpeedSlow.Checked) ? "slow" : "fast";
+            bool autoSpread = chkAutoSpread != null && chkAutoSpread.Checked;
+            Func<string, Action<string>, bool> job = PrepareGenerationJob();
+            if (job == null) return;
 
             btnGenerate.Enabled = false;
             btnGenerate.Text = "Oluşturuluyor...";
@@ -7509,8 +9979,7 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
 
                 System.Threading.ThreadPool.QueueUserWorkItem(_ =>
                 {
-                    bool success = ExecuteSequentialGeneration(bakPath, outPath, sNum, eNum, incGen, seqH, emboss, embed,
-                        fontSeq, seqG, seqW, AppendLog, material, color1Hex, color2Hex, color3Hex, seqStr, chosenSpeedProfile, seqLH);
+                    bool success = job(outPath, AppendLog);
 
                     if (success)
                     {
@@ -7560,9 +10029,7 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
 
                 System.Threading.ThreadPool.QueueUserWorkItem(_ =>
                 {
-                    bool success = ExecuteGeneration(topText, botText, bakPath, outPath, emboss, embed, fontTop, fontBot, 
-                        textHTop, textHBot, gapTop, gapBot, scaleTop, scaleBot, AppendLog, material, color1Hex, color2Hex,
-                        stretchTop, stretchBot, isMarka, chosenSpeedProfile, useSoftG);
+                    bool success = job(outPath, AppendLog);
 
                     if (success)
                     {
@@ -7996,6 +10463,10 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
             bool seqGender = true;
             double seqH = 7.00;
             double seqLayer = 0.12;
+            bool cliSpread = false;
+            string batchNames = null, batchFil = "#1A4FD8,#FFFFFF,#D80000,#FFE600", batchCombos = "1-2x1";
+            int batchPerPlate = 40;
+            string batchNums = null;
             for (int i = 1; i < args.Length; i++)
             {
                 if (args[i] == "--top" && i + 1 < args.Length) top = args[++i];
@@ -8009,24 +10480,59 @@ private static List<PointF> CleanContour(List<PointF> pts, double tol)
                 else if (args[i] == "--mat" && i + 1 < args.Length) material = args[++i];
                 else if (args[i] == "--layer" && i + 1 < args.Length) seqLayer = double.Parse(args[++i], CultureInfo.InvariantCulture);
                 else if (args[i] == "--marka") isMarka = true;
+                else if (args[i] == "--spread") cliSpread = true;
+                else if (args[i] == "--names" && i + 1 < args.Length) batchNames = args[++i];
+                else if (args[i] == "--nums" && i + 1 < args.Length) batchNums = args[++i];
+                else if (args[i] == "--fil" && i + 1 < args.Length) batchFil = args[++i];
+                else if (args[i] == "--combos" && i + 1 < args.Length) batchCombos = args[++i];
+                else if (args[i] == "--perplate" && i + 1 < args.Length) batchPerPlate = int.Parse(args[++i], CultureInfo.InvariantCulture);
                 else if (args[i] == "--seq") isSeq = true;
                 else if (args[i] == "--end" && i + 1 < args.Length) seqEnd = int.Parse(args[++i], CultureInfo.InvariantCulture);
                 else if (args[i] == "--chamfer" && i + 1 < args.Length) DefaultOverhangChamferDeg = double.Parse(args[++i], CultureInfo.InvariantCulture);
             }
 
             bool ok;
-            if (isSeq)
+            if (batchNames != null || batchNums != null)
+            {
+                // --names "ÜST|ALT;ÜST|ALT"  --fil "#hex,#hex,#hex,#hex"  --combos "1-2x10,3-4x5" (koyu-açık x adet)
+                List<string[]> nl = new List<string[]>();
+                foreach (string part in (batchNames ?? "").Split(';'))
+                {
+                    string[] tb = part.Split('|');
+                    if (tb.Length >= 2 && tb[0].Trim().Length > 0) nl.Add(new[] { ProcessTextWithSoftG(tb[0].Trim(), useSoftG), ProcessTextWithSoftG(tb[1].Trim(), useSoftG) });
+                    else if (tb.Length == 1 && tb[0].Trim().Length > 0) nl.Add(new[] { tb[0].Trim() });
+                }
+                if (batchNums != null)
+                {
+                    // --nums "1-10" -> 01..10 numara klipsleri (Sıralı ayarlarıyla)
+                    string[] se = batchNums.Split('-');
+                    foreach (string lbl in BuildLabels(int.Parse(se[0]), int.Parse(se[1]), false)) nl.Add(new[] { lbl });
+                }
+                List<int[]> cl = new List<int[]>();
+                foreach (string part in batchCombos.Split(','))
+                {
+                    string[] dq = part.Split('x');
+                    string[] dl = dq[0].Split('-');
+                    cl.Add(new[] { int.Parse(dl[0]), int.Parse(dl[1]), dq.Length > 1 ? int.Parse(dq[1]) : 1 });
+                }
+                Console.WriteLine("[CLI] Toplu Başlatılıyor: " + nl.Count + " isim, " + cl.Count + " renk çifti");
+                ok = ExecuteBatchGeneration(bak, outP, nl, cl, batchFil.Split(','), emboss, embed, fontTop, fontBot,
+                    textHTop, textHBot, gapTop, gapBot, scaleTop, scaleBot, stretchTop, stretchBot, useSoftG,
+                    s => Console.WriteLine(s), material, speed, cliSpread, batchPerPlate,
+                    fontTop, seqH, gapTop, scaleTop, 100.0);
+            }
+            else if (isSeq)
             {
                 Console.WriteLine("[CLI] Sıralı Başlatılıyor: " + seqStart + ".." + seqEnd);
                 ok = ExecuteSequentialGeneration(bak, outP, seqStart, seqEnd, seqGender, seqH, emboss, embed,
-                    fontTop, gapTop, scaleTop, s => Console.WriteLine(s), material, c1, c2, "#FFFFFF", 100.0, speed, seqLayer);
+                    fontTop, gapTop, scaleTop, s => Console.WriteLine(s), material, c1, c2, "#FFFFFF", 100.0, speed, seqLayer, cliSpread);
             }
             else
             {
                 Console.WriteLine("[CLI] Başlatılıyor: " + top + " / " + bot);
                 ok = ExecuteGeneration(top, bot, bak, outP, emboss, embed, fontTop, fontBot,
                     textHTop, textHBot, gapTop, gapBot, scaleTop, scaleBot, s => Console.WriteLine(s),
-                    material, c1, c2, stretchTop, stretchBot, isMarka, speed, useSoftG);
+                    material, c1, c2, stretchTop, stretchBot, isMarka, speed, useSoftG, cliSpread);
             }
             Console.WriteLine("[CLI] Sonuç: " + (ok ? "BAŞARILI" : "BAŞARISIZ"));
             return;
